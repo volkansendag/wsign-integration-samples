@@ -5,10 +5,12 @@ W.Sign ile e-imza entegrasyonunun **ne kadar basit** olduğunu gösteren resmi
 3D-Secure ödeme akışına benzeyen **redirect-session** modeli.
 
 > **5 dakikada özet:** Oturum açarsınız, kullanıcıyı W.Sign'a yönlendirirsiniz,
-> imza bitince W.Sign size HMAC imzalı bir callback gönderir. Entegratör
-> tarafında yazmanız gereken tek şey budur — birkaç HTTP çağrısı.
+> kullanıcı dönünce imzalı belgeyi outbound bir GET ile **çekersiniz (pull)**.
+> Pull yerelde **tünelsiz** çalışır. Üretimde ayrıca opsiyonel bir **callback
+> (webhook)** güvenlik ağı eklersiniz. Entegratör tarafında yazmanız gereken tek
+> şey budur — birkaç HTTP çağrısı.
 
-## Akış (3D-Secure gibi)
+## Akış (3D-Secure gibi) — redirect + pull
 
 ```
  ┌────────────┐                                              ┌──────────────┐
@@ -29,19 +31,25 @@ W.Sign ile e-imza entegrasyonunun **ne kadar basit** olduğunu gösteren resmi
  │ Kullanıcı W.Sign'da│  (Desktop'ta sertifika seçer + PIN girer;   │
  │ belgeyi imzalar    │   belge kullanıcının PC'sine inmez)         │
  └─────────┬──────────┘                                             │
-           │                                  4. POST callbackUrl   │
-           │                          X-WSign-Signature: sha256=... │
- ┌─────────▼───────────┐◄──────────────────────────────────────────┤
- │  Entegratör Backend │  {sessionId, status, nonce,                │
- │  • HMAC doğrula     │   signedContentBase64, ...}                │
- │  • nonce doğrula    │                                            │
- │  • imzalı belgeyi   │  5. 302 → successRedirectUrl               │
- │    sakla            │ ◄──────────────────────────────────────────
+           │ 4. 302 → successRedirectUrl (/imza/tamam?session={id}) │
+ ┌─────────▼───────────┐                                            │
+ │  Entegratör Backend │  4a. PULL (birincil):                      │
+ │                     │  GET /v1/redirect-sign/sessions/{id}/result│
+ │  • nonce doğrula    │ ─────────────────────────────────────────►│
+ │  • imzalı belgeyi   │  X-WSign-Api-Key                           │
+ │    sakla (idempotent)◄──────────────────────────────────────────┤
+ │                     │  200 {status, signedContentBase64, nonce…} │
  └─────────┬───────────┘                                            │
-           │ 5. GET /imza/tamam → "İmza tamamlandı" + imzalı belge  │
+           │ "İmza tamamlandı" + imzalı belge gösterilir            │
            ▼                                                        │
+    ┌───────────────────────────────────────────────────────────┐  │
+    │ 4b. PUSH (opsiyonel güvenlik ağı): W.Sign → POST callbackUrl│◄─┘
+    │     X-WSign-Signature: sha256=…  (HMAC + nonce doğrula)     │
+    │     Kullanıcı hiç dönmese bile teslimi garantiler.          │
+    └───────────────────────────────────────────────────────────┘
 ```
 
+Push vs pull ayrıntısı: [`docs/push-vs-pull.md`](docs/push-vs-pull.md).
 Daha ayrıntılı diyagram: [`docs/sequence.md`](docs/sequence.md).
 
 ## Bu depo neyi içerir, neyi içermez
@@ -49,7 +57,7 @@ Daha ayrıntılı diyagram: [`docs/sequence.md`](docs/sequence.md).
 | İçerir | İçermez |
 |---|---|
 | İstemci/entegratör tarafı kod (.NET, PHP, Python) | W.Sign çekirdeği (CMS, kripto) |
-| REST çağrıları + callback HMAC doğrulaması | W.Sign Server / oturum durum makinesi |
+| REST çağrıları + pull (result) + callback HMAC | W.Sign Server / oturum durum makinesi |
 | Çalışan örnek web uygulaması (3 dil) | PKCS#11 / sertifika / Desktop kodu |
 
 Bu kasıtlıdır: entegrasyon yalnızca **REST + HMAC** üzerinden yapılır; W.Sign'ın
@@ -59,23 +67,31 @@ token yönetmesine gerek yoktur.
 ## Senaryo
 
 Kurgusal **"Örnek Belediye"** bir belge metni üretir ve W.Sign ile imzalatır.
-Üç örnek de tıpatıp aynı 5 adımı uygular:
+Üç örnek de tıpatıp aynı adımları uygular:
 
 1. Belge oluşturma formu (`GET /`).
 2. "İmzala" → `POST /v1/redirect-sign/sessions` → `{sessionId, redirectUrl}`.
 3. Kullanıcıyı `redirectUrl`'e 302 yönlendir.
-4. `POST /wsign/callback` → **HMAC + nonce doğrula** → imzalı belgeyi sakla.
-5. `GET /imza/tamam` → sonuç sayfası.
+4. Kullanıcı `GET /imza/tamam?session={id}`'e döner → **pull (birincil):**
+   `GET /v1/redirect-sign/sessions/{id}/result` (`X-WSign-Api-Key`) →
+   **nonce doğrula** → imzalı belgeyi sakla → sonuç sayfası.
+5. **(Opsiyonel güvenlik ağı)** `POST /wsign/callback` → **HMAC + nonce doğrula**
+   → imzalı belgeyi sakla (pull ile aynı idempotent yol).
 
 ## Hızlı başlangıç
 
 ```bash
-# 1) Yapılandırmayı hazırlayın
+# 1) Yapılandırmayı hazırlayın: .env.example'ı .env olarak kopyalayıp doldurun.
 cp .env.example .env
 #    .env içindeki değerleri doldurun (aşağıya bakın).
+#    .env git'e GİTMEZ (.gitignore'da) — sırlarınız depoya sızmaz.
 
 # 2) İstediğiniz dili çalıştırın
 ```
+
+Her üç örnek de başlangıçta depo kökündeki `.env`'i otomatik yükler (harici
+bağımlılık yok). Öncelik: **process env > `.env` > placeholder fallback** — bir
+değişkeni kabukta da tanımlarsanız o `.env`'i ezer.
 
 | Dil | Komut | Adres |
 |---|---|---|
@@ -99,20 +115,33 @@ Her dilin kendi README'sinde ayrıntı vardır: [dotnet](dotnet/README.md) ·
 > yayınlanacaktır (`api.sign.wsoft.tr` üzerinde sandbox tenant). O zamana kadar
 > kendi W.Sign Server adresinizi ve anahtarınızı `.env` ile verin.
 
-> **callback erişimi:** W.Sign callback POST'unu `PUBLIC_BASE_URL` adresine
-> gönderir. Yerel geliştirmede bu adres internetten erişilemez; `cloudflared`
-> veya `ngrok` gibi bir tünel açıp tünel adresini `PUBLIC_BASE_URL` verin.
+> **Yerel test — tünel GEREKMEZ:** redirect + pull akışı outbound çalışır.
+> Yalnızca `localhost` host'unu entegratör kaydınızın **redirect allowlist**'ine
+> ekleyin (kullanıcının `successRedirectUrl`'e dönebilmesi için); `PUBLIC_BASE_URL`
+> `http://localhost:5000` kalabilir. Sonuç, backend'in W.Sign'a yaptığı GET ile
+> çekilir. **callback opsiyoneldir** ve yalnızca onu da denemek isterseniz bir
+> tünel (`cloudflared` / `ngrok`) gerektirir (aşağıya bakın).
 
-## Güvenlik — callback'i mutlaka doğrulayın
+## Güvenlik
 
-Callback endpoint'i internete açıktır. Her örnek iki bağımsız kontrol yapar:
+İmza sonucu iki yoldan alınabilir; her ikisi de iki bağımsız kontrol uygular.
+
+**Pull** (`GET /sessions/{id}/result`):
+
+1. **Auth + sahiplik** — `X-WSign-Api-Key` zorunludur; yalnızca oturumu açan
+   entegratör sonucu görür (başkasının/bilinmeyen oturumu → **404**). Session
+   id'yi ele geçiren biri imzalı belgeyi çekemez.
+2. **nonce** — yanıttaki değer, oturum açarken sakladığınızla sabit-zamanlı
+   karşılaştırılır.
+
+**Push** (callback, internete açık):
 
 1. **HMAC-SHA256** — `X-WSign-Signature: sha256=<hex>` başlığını **ham gövde**
    üzerinde, paylaşılan secret ile sabit-zamanlı karşılaştırır.
-2. **nonce** — oturum açarken üretilen rastgele değerin callback'te aynen
-   dönmesini doğrular (replay/CSRF koruması).
+2. **nonce** — pull'daki ile aynı kontrol (replay/CSRF koruması).
 
-Her dilde doğrulama snippet'i: [`docs/hmac-verify.md`](docs/hmac-verify.md).
+Push vs pull (ne zaman hangisi): [`docs/push-vs-pull.md`](docs/push-vs-pull.md).
+Her dilde HMAC snippet'i: [`docs/hmac-verify.md`](docs/hmac-verify.md).
 Tam REST sözleşmesi: [`docs/rest-contract.md`](docs/rest-contract.md).
 
 ## Lisans

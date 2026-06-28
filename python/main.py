@@ -2,8 +2,10 @@
 # W.Sign entegrasyon örneği — FastAPI
 #
 # Bu dosya, bir entegratör web uygulamasının W.Sign ile e-imza akışını kurmak
-# için yazması gereken kodun TAMAMIDIR. Gördüğünüz gibi sadece birkaç HTTP
-# çağrısı: oturum aç -> kullanıcıyı yönlendir -> callback'i HMAC ile doğrula.
+# için yazması gereken kodun TAMAMIDIR. Birincil akış "redirect + pull":
+# oturum aç -> kullanıcıyı yönlendir -> kullanıcı dönünce sonucu outbound GET ile
+# çek (pull). Ek olarak opsiyonel bir callback (push/webhook) "güvenlik ağı"
+# vardır; ikisi de aynı idempotent mantığı paylaşır.
 #
 # W.Sign'ın içselleri (CMS üretimi, PKCS#11, sertifika, oturum durum makinesi)
 # sunucu tarafında kapalıdır. Entegrasyon yalnızca REST + HMAC üzerindendir.
@@ -26,10 +28,31 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 
-# --- Yapılandırma: yalnızca ortam değişkenlerinden. Hiçbir sır hardcode değil. ---
+# Bağımlılıksız basit .env yükleyici: depo kökündeki ".env"i okur (varsa).
+# KEY=VALUE satırları; boş satır ve '#' yorumları atlanır; zaten tanımlı olan
+# process env'in ÜZERİNE YAZMAZ → process env > .env > placeholder fallback.
+def _load_dotenv() -> None:
+    path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if key and key not in os.environ:  # process env varsa ezme
+                os.environ[key] = val
+
+
+_load_dotenv()
+
+
+# --- Yapılandırma: ortam değişkenlerinden (process env veya .env). Hiçbir sır hardcode değil. ---
 def env(key: str, fallback: str) -> str:
     v = os.environ.get(key)
     return v if v else fallback
@@ -110,7 +133,44 @@ async def sign(belgeMetni: str = Form("")):
 
 
 # ---------------------------------------------------------------------------
-# 3) Callback: HMAC + nonce doğrula, imzalı belgeyi sakla
+# 3) Sonuç sayfası (successRedirectUrl) — BİRİNCİL: pull ile sonucu çek
+#
+# Kullanıcı imzadan sonra buraya döner. Sonucu W.Sign'dan outbound bir GET ile
+# çekeriz (pull). Bu, NAT/localhost arkasından TÜNELSİZ çalışır ve senkron UX
+# verir. Pull authed'dir (X-WSign-Api-Key) ve yalnızca oturumu açan entegratör
+# sonucu görür (başkasının oturumu -> 404).
+# ---------------------------------------------------------------------------
+@app.get("/imza/tamam", response_class=HTMLResponse)
+async def result(session: str = ""):
+    rec = sessions.get(session)
+    if rec is None:
+        return HTMLResponse(page_error("Oturum bulunamadı."))
+
+    # Henüz tamamlanmadıysa (ya da callback henüz gelmediyse) sonucu pull et.
+    if rec.get("status") != "completed":
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{API_BASE}/v1/redirect-sign/sessions/{session}/result",
+                    headers={"X-WSign-Api-Key": API_KEY},
+                )
+            # 404/401 vb. -> henüz bizim sonucumuz yok; sayfayı mevcut durumla göster.
+            if resp.status_code // 100 == 2:
+                apply_result(rec, resp.json())
+        except httpx.HTTPError:
+            pass  # pull başarısızsa callback güvenlik ağı devreye girer; yine de göster
+
+    return HTMLResponse(page_result(session, rec))
+
+
+# ---------------------------------------------------------------------------
+# 4) Callback (OPSİYONEL güvenlik ağı / webhook) — push: W.Sign -> entegratör
+#
+# Pull birincil akıştır. Bu callback, kullanıcı successRedirectUrl'e hiç
+# dönmese bile (tarayıcı kapandı, ağ koptu) sonucu güvenilir biçimde almak için
+# üretimde önerilir. İnternete açık bir adres (veya tünel) ister. Pull ile
+# AYNI idempotent mantığı (apply_result) paylaşır: aynı sonuç iki kez gelse
+# sorun olmaz.
 # ---------------------------------------------------------------------------
 @app.post("/wsign/callback")
 async def callback(request: Request):
@@ -134,27 +194,33 @@ async def callback(request: Request):
     if rec is None:
         return JSONResponse({"error": "unknown_session"}, status_code=404)
 
-    # nonce doğrulaması: callback gerçekten bizim başlattığımız oturuma ait mi?
-    if not hmac.compare_digest(rec["nonce"], cb.get("nonce", "")):
+    # nonce doğrulaması + idempotent uygulama (pull ile ortak).
+    if not apply_result(rec, cb):
         return JSONResponse({"error": "nonce_mismatch"}, status_code=401)
-
-    rec["status"] = cb.get("status", "unknown")
-    rec["signedContentBase64"] = cb.get("signedContentBase64")
-    rec["signerCertificateBase64"] = cb.get("signerCertificateBase64")
-    rec["completedAt"] = cb.get("completedAt")
 
     return JSONResponse({"received": True})
 
 
 # ---------------------------------------------------------------------------
-# 4) Sonuç sayfası (successRedirectUrl)
+# 5) İmzalı dosyayı indir — saklanan DER CMS'i .p7s olarak sun
 # ---------------------------------------------------------------------------
-@app.get("/imza/tamam", response_class=HTMLResponse)
-def result(session: str = ""):
+@app.get("/imza/indir")
+def download(session: str = ""):
     rec = sessions.get(session)
-    if rec is None:
-        return HTMLResponse(page_error("Oturum bulunamadı."))
-    return HTMLResponse(page_result(session, rec))
+    if rec is None or not rec.get("signedContentBase64"):
+        return HTMLResponse(page_error("İmzalı içerik bulunamadı."), status_code=404)
+    data = base64.b64decode(rec["signedContentBase64"])
+    base_name = os.path.splitext(rec.get("documentName", "imza"))[0]
+    # İndirilen dosyanın MIME ve uzantısı, W.Sign result yanıtından gelen
+    # contentType/fileExtension ile belirlenir (imza profiline göre değişir).
+    # Alanlar yoksa güvenli fallback: attached CAdES-BES.
+    content_type = rec.get("contentType") or "application/pkcs7-mime"
+    file_ext = rec.get("fileExtension") or ".p7s"
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{base_name}{file_ext}"'},
+    )
 
 
 @app.get("/imza/iptal", response_class=HTMLResponse)
@@ -165,6 +231,27 @@ def cancelled() -> str:
 # ===========================================================================
 # Yardımcılar
 # ===========================================================================
+
+# İmza sonucunu kayda idempotent uygula (pull + callback ortak yardımcısı).
+# nonce'u sabit-zamanlı doğrular: sonuç gerçekten bizim oturumumuza mı ait?
+# Aynı sonuç ikinci kez gelse de aynı değerleri yazar -> güvenle tekrar edilebilir.
+def apply_result(rec: dict, data: dict) -> bool:
+    if not hmac.compare_digest(rec.get("nonce", ""), data.get("nonce") or ""):
+        return False
+    if data.get("status"):
+        rec["status"] = data["status"]
+    if data.get("signedContentBase64"):
+        rec["signedContentBase64"] = data["signedContentBase64"]
+    if data.get("signerCertificateBase64"):
+        rec["signerCertificateBase64"] = data["signerCertificateBase64"]
+    if data.get("completedAt"):
+        rec["completedAt"] = data["completedAt"]
+    if data.get("contentType"):
+        rec["contentType"] = data["contentType"]
+    if data.get("fileExtension"):
+        rec["fileExtension"] = data["fileExtension"]
+    return True
+
 
 # HMAC-SHA256, sabit-zamanlı karşılaştırma. Başlık biçimi: "sha256=<hex>".
 def verify_hmac(raw_body: bytes, signature_header: str, secret: bytes) -> bool:
@@ -214,7 +301,11 @@ def page_result(session_id: str, rec: dict) -> str:
     signed_raw = rec.get("signedContentBase64") or ""
     if signed_raw:
         trunc = signed_raw[:120] + "…" if len(signed_raw) > 120 else signed_raw
-        signed = f'<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{escape(trunc)}</div>'
+        signed = (
+            f'<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{escape(trunc)}</div>'
+            f'<p><a href="/imza/indir?session={escape(session_id)}">'
+            f'<button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>'
+        )
     else:
         signed = "<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>"
     return f"""<!doctype html><html lang="tr"><head>{HEAD}</head><body>

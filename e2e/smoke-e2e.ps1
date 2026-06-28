@@ -3,9 +3,12 @@
 
   Bu script, GERÇEK USB token / W.Sign Desktop / tarayıcı GEREKTİRMEDEN sunucu
   protokolünün tamamını doğrular: create -> info -> prepare -> (yerel imza) ->
-  complete -> callback. İmzayı, private key'ini KENDİMİZ tuttuğumuz geçici bir
-  software (self-signed) sertifikayla üretir; böylece /prepare'in döndürdüğü
-  DataToSign'ı imzalayıp /complete'i sürebiliriz.
+  complete -> result (pull) -> callback. İmzayı, private key'ini KENDİMİZ
+  tuttuğumuz geçici bir software (self-signed) sertifikayla üretir; böylece
+  /prepare'in döndürdüğü DataToSign'ı imzalayıp /complete'i sürebiliriz.
+
+  "result (pull)" adımı, entegratörün birincil akışını (sonucu outbound GET ile
+  çekme) tünelsiz doğrular; webhook.site beklemeye gerek kalmaz.
 
   KAPSAMADIĞI (kasıtlı): nitelikli USB token, Desktop wsign:// UI, tarayıcı redirect.
   Bunlar manuel kart testinin konusu (bkz. e2e/README.md).
@@ -74,9 +77,18 @@ try {
   Write-Host "    status=$($done.status)"
   if ($done.status -ne "completed") { throw "complete status beklenen 'completed' değil: $($done.status)" }
 
+  # 6) result (PULL) -- entegratörün birincil akışı: sonucu authed GET ile çek (tünelsiz)
+  Step "GET /v1/redirect-sign/sessions/{id}/result (pull)"
+  $result = Invoke-RestMethod "$apiBase/v1/redirect-sign/sessions/$sid/result" -Headers $headers
+  Write-Host "    status=$($result.status)"
+  if ($result.status -ne "completed") { throw "result status beklenen 'completed' değil: $($result.status)" }
+  if (-not $result.signedContentBase64) { throw "result.signedContentBase64 boş -- imzalı içerik pull ile gelmedi!" }
+  if ($result.nonce -ne $nonce) { throw "result.nonce eşleşmiyor: beklenen '$nonce', gelen '$($result.nonce)'" }
+  Write-Host "    signedContentBase64 dolu, nonce eşleşti." -ForegroundColor Green
+
   Write-Host ""
-  Write-Host "E2E SUNUCU AKIŞI BAŞARILI." -ForegroundColor Green
-  Write-Host "Callback'i $callbackUrl adresinde kontrol et: X-WSign-Signature header'i + nonce='$nonce' eşleşmeli, signedContentBase64 dolu olmalı." -ForegroundColor Green
+  Write-Host "E2E SUNUCU AKIŞI BAŞARILI (pull doğrulandı)." -ForegroundColor Green
+  Write-Host "Opsiyonel callback'i $callbackUrl adresinde de kontrol edebilirsin: X-WSign-Signature header'i + nonce='$nonce' eşleşmeli, signedContentBase64 dolu olmalı." -ForegroundColor Green
 }
 finally {
   # Geçici sertifikayı temizle

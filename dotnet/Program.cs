@@ -2,8 +2,10 @@
 // W.Sign entegrasyon örneği — ASP.NET Core minimal API
 //
 // Bu dosya, bir entegratör web uygulamasının W.Sign ile e-imza akışını kurmak
-// için yazması gereken kodun TAMAMIDIR. Gördüğünüz gibi sadece birkaç HTTP
-// çağrısı: oturum aç → kullanıcıyı yönlendir → callback'i HMAC ile doğrula.
+// için yazması gereken kodun TAMAMIDIR. Birincil akış "redirect + pull":
+// oturum aç → kullanıcıyı yönlendir → kullanıcı dönünce sonucu outbound GET ile
+// çek (pull). Ek olarak opsiyonel bir callback (push/webhook) "güvenlik ağı"
+// vardır; ikisi de aynı idempotent mantığı paylaşır.
 //
 // W.Sign'ın içselleri (CMS üretimi, PKCS#11, sertifika, oturum durum makinesi)
 // sunucu tarafında kapalıdır. Entegrasyon yalnızca REST + HMAC üzerindendir.
@@ -20,7 +22,11 @@ using System.Text.Json.Serialization;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-// --- Yapılandırma: yalnızca ortam değişkenlerinden. Hiçbir sır hardcode değil. ---
+// Kök .env dosyasını (varsa) ortam değişkenlerine yükle. Zaten tanımlı olan
+// process env'i EZMEZ → process env > .env > placeholder fallback önceliği.
+LoadDotEnv();
+
+// --- Yapılandırma: ortam değişkenlerinden (process env veya .env). Hiçbir sır hardcode değil. ---
 string ApiBase()        => Env("WSIGN_API_BASE", "https://api.sign.wsoft.tr");
 string ApiKey()         => Env("WSIGN_API_KEY", "demo-REPLACE-ME");
 string CallbackSecret() => Env("WSIGN_CALLBACK_SECRET", "demo-callback-secret-REPLACE-ME");
@@ -28,6 +34,33 @@ string PublicBaseUrl()  => Env("PUBLIC_BASE_URL", "http://localhost:5000").TrimE
 
 static string Env(string key, string fallback) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
+
+// Bağımlılıksız basit .env yükleyici: çalışma dizininden yukarı doğru ilk
+// bulunan ".env"i okur. KEY=VALUE satırları; boş satır ve '#' yorumları atlanır;
+// zaten set olan ortam değişkeninin ÜZERİNE YAZMAZ.
+static void LoadDotEnv()
+{
+    for (var dir = new DirectoryInfo(Directory.GetCurrentDirectory()); dir is not null; dir = dir.Parent)
+    {
+        var path = Path.Combine(dir.FullName, ".env");
+        if (!File.Exists(path)) continue;
+
+        foreach (var raw in File.ReadAllLines(path))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line[0] == '#') continue;
+            var eq = line.IndexOf('=');
+            if (eq <= 0) continue;
+            var key = line[..eq].Trim();
+            var val = line[(eq + 1)..].Trim();
+            if (key.Length == 0) continue;
+            // process env varsa ezme (öncelik process env'de).
+            if (Environment.GetEnvironmentVariable(key) is { Length: > 0 }) continue;
+            Environment.SetEnvironmentVariable(key, val);
+        }
+        return; // ilk .env bulundu, dur.
+    }
+}
 
 // --- Basit in-memory oturum deposu (üretimde: veritabanı). ---
 var sessions = new ConcurrentDictionary<string, SessionRecord>();
@@ -99,7 +132,50 @@ app.MapPost("/sign", async (HttpRequest req) =>
 });
 
 // ---------------------------------------------------------------------------
-// 3) Callback: HMAC + nonce doğrula, imzalı belgeyi sakla
+// 3) Sonuç sayfası (successRedirectUrl) — BİRİNCİL: pull ile sonucu çek
+//
+// Kullanıcı imzadan sonra buraya döner. Sonucu W.Sign'dan outbound bir GET ile
+// çekeriz (pull). Bu, NAT/localhost arkasından TÜNELSİZ çalışır ve senkron UX
+// verir. Pull authed'dir (X-WSign-Api-Key) ve yalnızca oturumu açan entegratör
+// sonucu görür (başkasının oturumu → 404).
+// ---------------------------------------------------------------------------
+app.MapGet("/imza/tamam", async (string? session) =>
+{
+    if (string.IsNullOrEmpty(session) || !sessions.TryGetValue(session, out var rec))
+        return Results.Content(Pages.Error("Oturum bulunamadı."), "text/html; charset=utf-8");
+
+    // Henüz tamamlanmadıysa (ya da callback henüz gelmediyse) sonucu pull et.
+    if (rec.Status != "completed")
+    {
+        try
+        {
+            using var msg = new HttpRequestMessage(
+                HttpMethod.Get, $"{ApiBase()}/v1/redirect-sign/sessions/{session}/result");
+            msg.Headers.Add("X-WSign-Api-Key", ApiKey());
+            var resp = await http.SendAsync(msg);
+            if (resp.IsSuccessStatusCode)
+            {
+                var result = await resp.Content.ReadFromJsonAsync<ResultResponse>(jsonOpts);
+                if (result is not null)
+                    ApplyResult(rec, result.Status, result.Nonce,
+                        result.SignedContentBase64, result.SignerCertificateBase64, result.CompletedAt,
+                        result.ContentType, result.FileExtension);
+            }
+            // 404/401 vb. → henüz bizim sonucumuz yok; sayfayı mevcut durumla göster.
+        }
+        catch { /* pull başarısızsa callback güvenlik ağı devreye girer; yine de göster */ }
+    }
+
+    return Results.Content(Pages.Result(session, rec), "text/html; charset=utf-8");
+});
+
+// ---------------------------------------------------------------------------
+// 4) Callback (OPSİYONEL güvenlik ağı / webhook) — push: W.Sign → entegratör
+//
+// Pull birincil akıştır. Bu callback, kullanıcı successRedirectUrl'e hiç
+// dönmese bile (tarayıcı kapandı, ağ koptu) sonucu güvenilir biçimde almak için
+// üretimde önerilir. İnternete açık bir adres (veya tünel) ister. Pull ile
+// AYNI idempotent mantığı paylaşır: aynı sonuç iki kez gelse sorun olmaz.
 // ---------------------------------------------------------------------------
 app.MapPost("/wsign/callback", async (HttpRequest req) =>
 {
@@ -121,27 +197,32 @@ app.MapPost("/wsign/callback", async (HttpRequest req) =>
     if (!sessions.TryGetValue(cb.SessionId, out var rec))
         return Results.NotFound("Bilinmeyen oturum.");
 
-    // nonce doğrulaması: callback gerçekten bizim başlattığımız oturuma ait mi?
-    if (!FixedTimeEquals(cb.Nonce ?? "", rec.Nonce))
+    // nonce doğrulaması + idempotent uygulama (pull ile ortak).
+    if (!ApplyResult(rec, cb.Status, cb.Nonce, cb.SignedContentBase64, cb.SignerCertificateBase64, cb.CompletedAt,
+            cb.ContentType, cb.FileExtension))
         return Results.Unauthorized();
-
-    rec.Status = cb.Status ?? "unknown";
-    rec.SignedContentBase64 = cb.SignedContentBase64;
-    rec.SignerCertificateBase64 = cb.SignerCertificateBase64;
-    rec.CompletedAt = cb.CompletedAt;
-    sessions[cb.SessionId] = rec;
 
     return Results.Ok(new { received = true });
 });
 
 // ---------------------------------------------------------------------------
-// 4) Sonuç sayfası (successRedirectUrl)
+// 5) İmzalı dosyayı indir — saklanan DER CMS'i .p7s olarak sun
 // ---------------------------------------------------------------------------
-app.MapGet("/imza/tamam", (string? session) =>
+app.MapGet("/imza/indir", (string? session) =>
 {
-    if (string.IsNullOrEmpty(session) || !sessions.TryGetValue(session, out var rec))
-        return Results.Content(Pages.Error("Oturum bulunamadı."), "text/html; charset=utf-8");
-    return Results.Content(Pages.Result(session, rec), "text/html; charset=utf-8");
+    if (string.IsNullOrEmpty(session) || !sessions.TryGetValue(session, out var rec)
+        || string.IsNullOrEmpty(rec.SignedContentBase64))
+        return Results.NotFound("İmzalı içerik bulunamadı.");
+
+    var bytes    = Convert.FromBase64String(rec.SignedContentBase64);
+    var baseName = Path.GetFileNameWithoutExtension(rec.DocumentName);
+    // İndirilen dosyanın MIME ve uzantısı, W.Sign result yanıtından gelen
+    // contentType/fileExtension ile belirlenir (imza profiline göre değişir:
+    // CAdES → application/pkcs7-mime/.p7s, PAdES → application/pdf/.pdf vb.).
+    // Alanlar yoksa güvenli fallback: attached CAdES-BES.
+    var contentType = string.IsNullOrEmpty(rec.ContentType) ? "application/pkcs7-mime" : rec.ContentType;
+    var fileExt     = string.IsNullOrEmpty(rec.FileExtension) ? ".p7s" : rec.FileExtension;
+    return Results.File(bytes, contentType, $"{baseName}{fileExt}");
 });
 
 app.MapGet("/imza/iptal", () => Results.Content(Pages.Error("İmza iptal edildi."), "text/html; charset=utf-8"));
@@ -151,6 +232,24 @@ app.Run();
 // ===========================================================================
 // Yardımcılar
 // ===========================================================================
+
+// İmza sonucunu kayda idempotent uygula (pull + callback ortak yardımcısı).
+// nonce'u sabit-zamanlı doğrular: sonuç gerçekten bizim oturumumuza mı ait?
+// Aynı sonuç ikinci kez gelse de aynı değerleri yazar → güvenle tekrar edilebilir.
+static bool ApplyResult(SessionRecord rec, string? status, string? nonce,
+    string? signedContentBase64, string? signerCertificateBase64, string? completedAt,
+    string? contentType, string? fileExtension)
+{
+    if (!FixedTimeEquals(nonce ?? "", rec.Nonce))
+        return false;
+    if (!string.IsNullOrEmpty(status)) rec.Status = status;
+    if (!string.IsNullOrEmpty(signedContentBase64)) rec.SignedContentBase64 = signedContentBase64;
+    if (!string.IsNullOrEmpty(signerCertificateBase64)) rec.SignerCertificateBase64 = signerCertificateBase64;
+    if (!string.IsNullOrEmpty(completedAt)) rec.CompletedAt = completedAt;
+    if (!string.IsNullOrEmpty(contentType)) rec.ContentType = contentType;
+    if (!string.IsNullOrEmpty(fileExtension)) rec.FileExtension = fileExtension;
+    return true;
+}
 
 // HMAC-SHA256, sabit-zamanlı karşılaştırma. Başlık biçimi: "sha256=<hex>".
 static bool VerifyHmac(byte[] rawBody, string signatureHeader, byte[] secret)
@@ -183,6 +282,8 @@ sealed class SessionRecord
     public string? SignedContentBase64 { get; set; }
     public string? SignerCertificateBase64 { get; set; }
     public string? CompletedAt { get; set; }
+    public string? ContentType { get; set; }   // result'tan: imzalı dosyanın MIME'ı
+    public string? FileExtension { get; set; }  // result'tan: imzalı dosyanın uzantısı
 }
 
 sealed class CreateSessionResponse
@@ -201,7 +302,22 @@ sealed class CallbackBody
     public string? SignedContentBase64 { get; set; }
     public string? SignerCertificateBase64 { get; set; }
     public string? CompletedAt { get; set; }
+    public string? ContentType { get; set; }
+    public string? FileExtension { get; set; }
     public string? ErrorReason { get; set; }
+}
+
+// GET /v1/redirect-sign/sessions/{id}/result yanıtı (pull).
+sealed class ResultResponse
+{
+    public string? SessionId { get; set; }
+    public string? Status { get; set; }
+    public string? Nonce { get; set; }
+    public string? SignedContentBase64 { get; set; }
+    public string? SignerCertificateBase64 { get; set; }
+    public string? CompletedAt { get; set; }
+    public string? ContentType { get; set; }   // imzalı dosyanın MIME'ı (örn. application/pkcs7-mime)
+    public string? FileExtension { get; set; }  // imzalı dosyanın uzantısı (örn. .p7s)
 }
 
 // ===========================================================================
@@ -240,7 +356,10 @@ static class Pages
     {
         var statusClass = rec.Status == "completed" ? "ok" : "err";
         var signed = rec.SignedContentBase64 is { Length: > 0 }
-            ? $"""<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{Trunc(rec.SignedContentBase64)}</div>"""
+            ? $"""
+               <div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{Trunc(rec.SignedContentBase64)}</div>
+               <p><a href="/imza/indir?session={sessionId}"><button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>
+               """
             : "<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>";
         return $"""
             <!doctype html><html lang="tr"><head>{Head}</head><body>

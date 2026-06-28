@@ -3,7 +3,9 @@
 > Bu belge, bir **entegratörün** W.Sign ile e-imza akışı kurmak için bilmesi
 > gereken **dilden bağımsız** REST sözleşmesidir. 3D-Secure ödeme akışına
 > benzer: siz bir oturum açarsınız, kullanıcıyı W.Sign'a yönlendirirsiniz,
-> imza bitince W.Sign size bir callback gönderir.
+> kullanıcı dönünce sonucu **pull** ile çekersiniz (birincil) ve/veya W.Sign
+> size bir **callback** gönderir (opsiyonel güvenlik ağı). Push vs pull
+> karşılaştırması: [`push-vs-pull.md`](push-vs-pull.md).
 >
 > Bu örneklerde yalnızca **istemci/entegratör tarafı** vardır. W.Sign
 > çekirdeği (CMS üretimi, PKCS#11, sertifika doğrulama, oturum durum makinesi)
@@ -19,9 +21,10 @@
 
 Tüm çağrılar HTTPS zorunludur.
 
-## Entegratörün kullandığı 2 endpoint
+## Entegratörün kullandığı endpoint'ler
 
-Entegratör backend'i yalnızca iki endpoint çağırır. Geri kalan endpoint'leri
+Entegratör backend'i bu endpoint'leri çağırır: oturum oluştur (zorunlu), sonucu
+çek (pull — birincil), durum sorgula (opsiyonel). Geri kalan endpoint'leri
 (`/prepare`, `/complete`) W.Sign Desktop kullanır; entegratör bunları görmez.
 
 ### 1. Oturum oluştur — `POST /v1/redirect-sign/sessions`
@@ -59,9 +62,46 @@ Hatalar: `401 UNAUTHORIZED`, `400 INVALID_BODY|INVALID_NONCE|INVALID_PROFILE`,
 
 Entegratör `redirectUrl`'i alır ve kullanıcıyı **302** ile oraya yönlendirir.
 
-### 2. (Opsiyonel) Durum sorgula — `GET /v1/redirect-sign/sessions/{id}`
+### 2. Sonucu çek (pull — birincil) — `GET /v1/redirect-sign/sessions/{id}/result`
 
-Auth yok; `sessionId` taşıyıcıdır. Hassas veri (belge / dataToSign) DÖNMEZ.
+Kullanıcı `successRedirectUrl`'e döndüğünde entegratör backend'i imzalı belgeyi
+bu endpoint ile **outbound GET** olarak çeker. Çağrı entegratörden W.Sign'a doğru
+gittiği için **NAT/localhost arkasından tünelsiz** çalışır.
+
+İstek başlığı: `X-WSign-Api-Key: <api-key>` (zorunlu) — oturumu **oluşturan**
+entegratörün anahtarı.
+
+Yanıt `200`:
+
+```jsonc
+{
+  "sessionId":               "550e8400-...-a3f9c12b",
+  "status":                  "pending|awaitingSignature|signing|completed|expired|cancelled",
+  "signedContentBase64":     "<DER CMS — yalnızca completed; aksi halde null>",
+  "signerCertificateBase64": "<DER cert — yalnızca completed; aksi halde null>",
+  "contentType":             "application/pkcs7-mime",     // imzalı dosyanın MIME'ı (profile göre)
+  "fileExtension":           ".p7s",                       // imzalı dosyanın uzantısı (profile göre)
+  "completedAt":             "2026-06-28T10:00:00Z",      // completed değilse null
+  "nonce":                   "<istekteki nonce aynen>",
+  "metadata":                { "talepNo": "A-123" }        // opak; istekteki aynen
+}
+```
+
+- **Sahiplik:** yalnızca oturumu oluşturan entegratör çekebilir. Başka birinin
+  oturumu (veya bilinmeyen id) → **`404`**. Yani session id'yi ele geçiren biri
+  imzalı belgeyi alamaz.
+- **nonce:** entegratör, yanıttaki `nonce`'u sakladığı değerle sabit-zamanlı
+  karşılaştırmalıdır.
+- **Kota:** bu çağrı kota tüketmez; sonuç `completed` olana kadar güvenle birden
+  çok kez (kısa poll) çağrılabilir.
+- Hatalar: `401 UNAUTHORIZED` (anahtar yok/geçersiz), `404 NOT_FOUND` (oturum
+  size ait değil / yok).
+
+### 3. (Opsiyonel) Durum sorgula — `GET /v1/redirect-sign/sessions/{id}`
+
+Auth yok; `sessionId` taşıyıcıdır. Hassas veri (belge / dataToSign / imzalı
+içerik) DÖNMEZ — yalnızca durum/metadata. İmzalı içeriği almak için (2)'deki
+authed `/result` endpoint'ini kullanın.
 
 ```jsonc
 {
@@ -73,12 +113,12 @@ Auth yok; `sessionId` taşıyıcıdır. Hassas veri (belge / dataToSign) DÖNMEZ
 }
 ```
 
-Callback başarısız olursa entegratör bu endpoint ile sonucu yoklayabilir.
+## Callback (opsiyonel güvenlik ağı) — W.Sign → Entegratör
 
-## Callback — W.Sign → Entegratör
-
-İmza tamamlanınca (veya iptal/expiry'de) W.Sign, oturumda verdiğiniz
-`callbackUrl`'e **POST** gönderir.
+Pull birincil akıştır; callback üretimde **güvenilirlik için** önerilir:
+kullanıcı `successRedirectUrl`'e hiç dönmese bile sonucu teslim eder. İmza
+tamamlanınca (veya iptal/expiry'de) W.Sign, oturumda verdiğiniz `callbackUrl`'e
+**POST** gönderir. (Ne zaman hangisi: [`push-vs-pull.md`](push-vs-pull.md).)
 
 - Başlık: `X-WSign-Signature: sha256=<hex>` — gövdenin tamamı üzerinde
   HMAC-SHA256, **entegratörün `hmacSecret`'ı** ile hesaplanır.
@@ -92,14 +132,17 @@ Callback başarısız olursa entegratör bu endpoint ile sonucu yoklayabilir.
   "metadata":                { "talepNo": "A-123" },
   "signedContentBase64":     "<DER CMS — yalnızca completed>",
   "signerCertificateBase64": "<DER cert — yalnızca completed>",
+  "contentType":             "application/pkcs7-mime",  // imzalı dosyanın MIME'ı (profile göre)
+  "fileExtension":           ".p7s",                    // imzalı dosyanın uzantısı (profile göre)
   "completedAt":             "2026-06-27T14:32:11Z",
   "errorReason":             null
 }
 ```
 
 Entegratör doğrulama sonrası `200` döndürmelidir. Faz 0'da teslimat best-effort
-tek denemedir (Faz 2: 5s/30s/120s retry). Bu yüzden `GET /sessions/{id}` ile
-yoklama her zaman güvenli bir yedektir.
+tek denemedir (Faz 2: 5s/30s/120s retry). Bu yüzden authed
+`GET /sessions/{id}/result` ile pull her zaman güvenli bir yedektir: callback
+kaçsa bile sonucu uzlaştırır (reconcile).
 
 ## Desktop endpoint'leri (entegratörü ilgilendirmez)
 
@@ -110,9 +153,12 @@ zaman tarayıcıya/istemciye inmez. Entegratör bu uçları doğrudan kullanmaz.
 
 ## Güvenlik özeti
 
-- **API key** yalnızca `POST /sessions` ve `DELETE /sessions/{id}` için.
+- **API key** `POST /sessions`, `GET /sessions/{id}/result` ve
+  `DELETE /sessions/{id}` için. `/result` ayrıca oturum **sahipliği** uygular:
+  başkasının oturumu → 404.
 - **sessionId** tahmin edilemez (`{uuid}-{hmac8}`), tek kullanımlık, TTL'li.
-- **nonce** callback'i W.Sign'a bağlar (CSRF/replay koruması).
+- **nonce** sonucu (pull ve callback) sizin oturumunuza bağlar (CSRF/replay
+  koruması).
 - **callbackUrl / successRedirectUrl** host'ları entegratör kaydındaki
   allowlist ile sınırlıdır (open-redirect / SSRF önlemi).
 - **HMAC** callback gövdesinin gerçekten W.Sign'dan geldiğini kanıtlar.

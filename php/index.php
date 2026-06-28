@@ -3,8 +3,10 @@
 // W.Sign entegrasyon örneği — saf PHP (framework yok)
 //
 // Bu dosya, bir entegratör web uygulamasının W.Sign ile e-imza akışını kurmak
-// için yazması gereken kodun TAMAMIDIR. Gördüğünüz gibi sadece birkaç HTTP
-// çağrısı: oturum aç → kullanıcıyı yönlendir → callback'i HMAC ile doğrula.
+// için yazması gereken kodun TAMAMIDIR. Birincil akış "redirect + pull":
+// oturum aç → kullanıcıyı yönlendir → kullanıcı dönünce sonucu outbound GET ile
+// çek (pull). Ek olarak opsiyonel bir callback (push/webhook) "güvenlik ağı"
+// vardır; ikisi de aynı idempotent mantığı paylaşır.
 //
 // W.Sign'ın içselleri (CMS üretimi, PKCS#11, sertifika, oturum durum makinesi)
 // sunucu tarafında kapalıdır. Entegrasyon yalnızca REST + HMAC üzerindendir.
@@ -48,6 +50,8 @@ if ($method === 'GET' && $path === '/') {
     handle_callback($cfg);
 } elseif ($method === 'GET' && $path === '/imza/tamam') {
     handle_result($cfg);
+} elseif ($method === 'GET' && $path === '/imza/indir') {
+    handle_download($cfg);
 } elseif ($method === 'GET' && $path === '/imza/iptal') {
     echo page_error('İmza iptal edildi.');
 } else {
@@ -114,7 +118,73 @@ function handle_sign(array $cfg): void
 }
 
 // ---------------------------------------------------------------------------
-// 3) Callback: HMAC + nonce doğrula, imzalı belgeyi sakla
+// 3) Sonuç sayfası (successRedirectUrl) — BİRİNCİL: pull ile sonucu çek
+//
+// Kullanıcı imzadan sonra buraya döner. Sonucu W.Sign'dan outbound bir GET ile
+// çekeriz (pull). Bu, NAT/localhost arkasından TÜNELSİZ çalışır ve senkron UX
+// verir. Pull authed'dir (X-WSign-Api-Key) ve yalnızca oturumu açan entegratör
+// sonucu görür (başkasının oturumu → 404).
+// ---------------------------------------------------------------------------
+function handle_result(array $cfg): void
+{
+    $sessionId = $_GET['session'] ?? '';
+    $rec = $sessionId !== '' ? store_load($cfg, $sessionId) : null;
+    if ($rec === null) {
+        echo page_error('Oturum bulunamadı.');
+        return;
+    }
+
+    // Henüz tamamlanmadıysa (ya da callback henüz gelmediyse) sonucu pull et.
+    if (($rec['status'] ?? '') !== 'completed') {
+        [$status, $body] = http_get_json(
+            $cfg['api_base'] . '/v1/redirect-sign/sessions/' . rawurlencode($sessionId) . '/result',
+            ['X-WSign-Api-Key: ' . $cfg['api_key']]
+        );
+        // 404/401 vb. → henüz bizim sonucumuz yok; sayfayı mevcut durumla göster.
+        if ($status >= 200 && $status < 300) {
+            $result = json_decode((string) $body, true);
+            if (is_array($result) && apply_result($rec, $result)) {
+                store_save($cfg, $sessionId, $rec);
+            }
+        }
+    }
+
+    echo page_result($sessionId, $rec);
+}
+
+// ---------------------------------------------------------------------------
+// 5) İmzalı dosyayı indir — saklanan DER CMS'i .p7s olarak sun
+// ---------------------------------------------------------------------------
+function handle_download(array $cfg): void
+{
+    $sessionId = $_GET['session'] ?? '';
+    $rec = $sessionId !== '' ? store_load($cfg, $sessionId) : null;
+    if ($rec === null || empty($rec['signedContentBase64'])) {
+        http_response_code(404);
+        echo page_error('İmzalı içerik bulunamadı.');
+        return;
+    }
+    $bytes    = base64_decode((string) $rec['signedContentBase64']);
+    $baseName = pathinfo($rec['documentName'] ?? 'imza', PATHINFO_FILENAME);
+    // İndirilen dosyanın MIME ve uzantısı, W.Sign result yanıtından gelen
+    // contentType/fileExtension ile belirlenir (imza profiline göre değişir).
+    // Alanlar yoksa güvenli fallback: attached CAdES-BES.
+    $contentType = !empty($rec['contentType'])   ? (string) $rec['contentType']   : 'application/pkcs7-mime';
+    $fileExt     = !empty($rec['fileExtension']) ? (string) $rec['fileExtension'] : '.p7s';
+    header('Content-Type: ' . $contentType);
+    header('Content-Disposition: attachment; filename="' . $baseName . $fileExt . '"');
+    header('Content-Length: ' . strlen($bytes));
+    echo $bytes;
+}
+
+// ---------------------------------------------------------------------------
+// 4) Callback (OPSİYONEL güvenlik ağı / webhook) — push: W.Sign → entegratör
+//
+// Pull birincil akıştır. Bu callback, kullanıcı successRedirectUrl'e hiç
+// dönmese bile (tarayıcı kapandı, ağ koptu) sonucu güvenilir biçimde almak için
+// üretimde önerilir. İnternete açık bir adres (veya tünel) ister. Pull ile
+// AYNI idempotent mantığı (apply_result) paylaşır: aynı sonuç iki kez gelse
+// sorun olmaz.
 // ---------------------------------------------------------------------------
 function handle_callback(array $cfg): void
 {
@@ -142,40 +212,38 @@ function handle_callback(array $cfg): void
         return;
     }
 
-    // nonce doğrulaması: callback gerçekten bizim başlattığımız oturuma ait mi?
-    if (!hash_equals($rec['nonce'], (string) ($cb['nonce'] ?? ''))) {
+    // nonce doğrulaması + idempotent uygulama (pull ile ortak).
+    if (!apply_result($rec, $cb)) {
         http_response_code(401);
         echo json_encode(['error' => 'nonce_mismatch']);
         return;
     }
-
-    $rec['status']                  = $cb['status'] ?? 'unknown';
-    $rec['signedContentBase64']     = $cb['signedContentBase64'] ?? null;
-    $rec['signerCertificateBase64'] = $cb['signerCertificateBase64'] ?? null;
-    $rec['completedAt']             = $cb['completedAt'] ?? null;
     store_save($cfg, $cb['sessionId'], $rec);
 
     http_response_code(200);
     echo json_encode(['received' => true]);
 }
 
-// ---------------------------------------------------------------------------
-// 4) Sonuç sayfası (successRedirectUrl)
-// ---------------------------------------------------------------------------
-function handle_result(array $cfg): void
-{
-    $sessionId = $_GET['session'] ?? '';
-    $rec = $sessionId !== '' ? store_load($cfg, $sessionId) : null;
-    if ($rec === null) {
-        echo page_error('Oturum bulunamadı.');
-        return;
-    }
-    echo page_result($sessionId, $rec);
-}
-
 // ===========================================================================
 // Yardımcılar
 // ===========================================================================
+
+// İmza sonucunu kayda idempotent uygula (pull + callback ortak yardımcısı).
+// nonce'u sabit-zamanlı doğrular: sonuç gerçekten bizim oturumumuza mı ait?
+// Aynı sonuç ikinci kez gelse de aynı değerleri yazar → güvenle tekrar edilebilir.
+function apply_result(array &$rec, array $data): bool
+{
+    if (!hash_equals((string) ($rec['nonce'] ?? ''), (string) ($data['nonce'] ?? ''))) {
+        return false;
+    }
+    if (!empty($data['status']))                  $rec['status'] = $data['status'];
+    if (!empty($data['signedContentBase64']))     $rec['signedContentBase64'] = $data['signedContentBase64'];
+    if (!empty($data['signerCertificateBase64'])) $rec['signerCertificateBase64'] = $data['signerCertificateBase64'];
+    if (!empty($data['completedAt']))             $rec['completedAt'] = $data['completedAt'];
+    if (!empty($data['contentType']))             $rec['contentType'] = $data['contentType'];
+    if (!empty($data['fileExtension']))           $rec['fileExtension'] = $data['fileExtension'];
+    return true;
+}
 
 // HMAC-SHA256, sabit-zamanlı karşılaştırma. Başlık biçimi: "sha256=<hex>".
 function verify_hmac(string $rawBody, string $signatureHeader, string $secret): bool
@@ -197,6 +265,25 @@ function http_post_json(string $url, string $json, array $headers): array
         CURLOPT_POSTFIELDS     => $json,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HTTPHEADER     => array_merge(['Content-Type: application/json'], $headers),
+        CURLOPT_TIMEOUT        => 30,
+    ]);
+    $body   = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    if ($body === false) {
+        $body = 'cURL hatası: ' . curl_error($ch);
+        $status = 0;
+    }
+    curl_close($ch);
+    return [$status, $body];
+}
+
+/** @return array{0:int,1:string|false} [statusCode, body] — pull GET için. */
+function http_get_json(string $url, array $headers): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER     => array_merge(['Accept: application/json'], $headers),
         CURLOPT_TIMEOUT        => 30,
     ]);
     $body   = curl_exec($ch);
@@ -256,7 +343,8 @@ function page_result(string $sessionId, array $rec): string
     $signedRaw   = $rec['signedContentBase64'] ?? '';
     if ($signedRaw !== '') {
         $trunc  = strlen($signedRaw) > 120 ? substr($signedRaw, 0, 120) . '…' : $signedRaw;
-        $signed = '<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>' . htmlspecialchars($trunc) . '</div>';
+        $signed = '<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>' . htmlspecialchars($trunc) . '</div>'
+            . '<p><a href="/imza/indir?session=' . rawurlencode($sessionId) . '"><button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>';
     } else {
         $signed = '<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>';
     }

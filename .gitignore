@@ -1,0 +1,33 @@
+# --- Secrets / local config ---
+.env
+.env.local
+*.local
+
+# --- .NET ---
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# --- PHP ---
+vendor/
+composer.lock
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Signed documents stored at runtime (samples persist demo output) ---
+**/signed-output/
+**/storage/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

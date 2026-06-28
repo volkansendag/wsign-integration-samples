@@ -1,0 +1,11 @@
+{
+  "name": "wsoft/wsign-integration-sample-php",
+  "description": "W.Sign redirect-session entegrasyon örneği (saf PHP, framework yok)",
+  "license": "MIT",
+  "type": "project",
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*"
+  }
+}

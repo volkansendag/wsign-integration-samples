@@ -14,6 +14,7 @@
 // ===========================================================================
 
 using System.Collections.Concurrent;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -37,6 +38,30 @@ string ReturnMode()     => Env("WSIGN_RETURN_MODE", "redirect");
 
 static string Env(string key, string fallback) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
+
+// Webhook (callbackUrl) yalnızca GERÇEKTEN ulaşılabilir + gerekli olduğunda
+// gönderilir. İki durumda hiç gönderilmez:
+//   • returnMode=post  → kapalı sistem; sonuç tarayıcı-POST'u ile gelir, webhook
+//     gereksiz.
+//   • PUBLIC_BASE_URL loopback (localhost/127.x/::1/0.0.0.0) → W.Sign bu adrese
+//     POST atamaz; backend ayrıca callback'i loopback/SSRF gerekçesiyle reddeder.
+// successRedirectUrl HER ZAMAN gönderilir (redirect + post bunu kullanır).
+bool ShouldSendCallback() =>
+    !string.Equals(ReturnMode(), "post", StringComparison.OrdinalIgnoreCase)
+    && !IsLoopbackHost(PublicBaseUrl());
+
+static bool IsLoopbackHost(string baseUrl)
+{
+    if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
+        return true; // ayrıştırılamıyorsa güvenli taraf: webhook gönderme
+    var host = uri.Host;
+    if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase))
+        return true;
+    if (IPAddress.TryParse(host, out var ip))
+        return IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any);
+    return false;
+}
 
 // Bağımlılıksız basit .env yükleyici: çalışma dizininden yukarı doğru ilk
 // bulunan ".env"i okur. KEY=VALUE satırları; boş satır ve '#' yorumları atlanır;
@@ -101,7 +126,9 @@ app.MapPost("/sign", async (HttpRequest req) =>
         documentName,
         signatureProfile = "CAdES-BES",
         digestAlgorithm = "SHA256",
-        callbackUrl = $"{PublicBaseUrl()}/wsign/callback",
+        // Webhook güvenlik ağı yalnızca ulaşılabilir + gerekli olduğunda gönderilir.
+        // null ise jsonOpts (WhenWritingNull) bu alanı çıktıdan tamamen atar.
+        callbackUrl = ShouldSendCallback() ? $"{PublicBaseUrl()}/wsign/callback" : null,
         successRedirectUrl = $"{PublicBaseUrl()}/imza/tamam",
         cancelRedirectUrl = $"{PublicBaseUrl()}/imza/iptal",
         nonce,

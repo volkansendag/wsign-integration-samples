@@ -83,7 +83,6 @@ function handle_sign(array $cfg): void
         'documentName'       => $documentName,
         'signatureProfile'   => 'CAdES-BES',
         'digestAlgorithm'    => 'SHA256',
-        'callbackUrl'        => $cfg['public_base_url'] . '/wsign/callback',
         'successRedirectUrl' => $cfg['public_base_url'] . '/imza/tamam',
         'cancelRedirectUrl'  => $cfg['public_base_url'] . '/imza/iptal',
         'nonce'              => $nonce,
@@ -94,6 +93,18 @@ function handle_sign(array $cfg): void
         // döndürür ve sonucu biz pull ederiz.
         'returnMode'         => $cfg['return_mode'],
     ];
+
+    // Webhook (callbackUrl) yalnızca GERÇEKTEN ulaşılabilir + gerekli olduğunda
+    // gönderilir. İki durumda hiç gönderilmez:
+    //   • returnMode=post → kapalı sistem; sonuç tarayıcı-POST'u ile gelir, webhook
+    //     gereksiz.
+    //   • PUBLIC_BASE_URL loopback (localhost/127.x/::1/0.0.0.0) → W.Sign bu adrese
+    //     POST atamaz; backend ayrıca callback'i loopback/SSRF gerekçesiyle reddeder.
+    // successRedirectUrl HER ZAMAN gönderilir (redirect + post bunu kullanır).
+    if (strtolower((string) $cfg['return_mode']) !== 'post'
+        && !is_loopback_host((string) $cfg['public_base_url'])) {
+        $payload['callbackUrl'] = $cfg['public_base_url'] . '/wsign/callback';
+    }
 
     [$status, $body] = http_post_json(
         $cfg['api_base'] . '/v1/redirect-sign/sessions',
@@ -306,6 +317,22 @@ function apply_result(array &$rec, array $data): bool
     if (!empty($data['contentType']))             $rec['contentType'] = $data['contentType'];
     if (!empty($data['fileExtension']))           $rec['fileExtension'] = $data['fileExtension'];
     return true;
+}
+
+// PUBLIC_BASE_URL host'u loopback mı? (localhost / *.localhost / 127.0.0.0/8 /
+// ::1 / 0.0.0.0). Loopback ise webhook ZATEN ulaşamaz → callbackUrl gönderilmez.
+function is_loopback_host(string $baseUrl): bool
+{
+    $host = strtolower((string) parse_url($baseUrl, PHP_URL_HOST));
+    if ($host === '') {
+        return true; // ayrıştırılamadı → güvenli taraf: webhook gönderme
+    }
+    $host = trim($host, '[]'); // IPv6 köşeli parantezleri temizle ([::1] → ::1)
+    return $host === 'localhost'
+        || str_ends_with($host, '.localhost')
+        || $host === '0.0.0.0'
+        || $host === '::1'
+        || str_starts_with($host, '127.');
 }
 
 // HMAC-SHA256, sabit-zamanlı karşılaştırma. Başlık biçimi: "sha256=<hex>".

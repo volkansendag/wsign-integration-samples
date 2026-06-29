@@ -126,8 +126,17 @@ Her dilin kendi README'sinde ayrıntı vardır: [dotnet](dotnet/README.md) ·
 > Yalnızca `localhost` host'unu entegratör kaydınızın **redirect allowlist**'ine
 > ekleyin (kullanıcının `successRedirectUrl`'e dönebilmesi için); `PUBLIC_BASE_URL`
 > `http://localhost:5000` kalabilir. Sonuç, backend'in W.Sign'a yaptığı GET ile
-> çekilir. **callback opsiyoneldir** ve yalnızca onu da denemek isterseniz bir
-> tünel (`cloudflared` / `ngrok`) gerektirir (aşağıya bakın).
+> çekilir.
+
+> **callbackUrl ne zaman gönderilir?** Örnekler `callbackUrl`'i yalnızca webhook
+> gerçekten kullanılabilir + gerekli olduğunda gönderir. **Yerel/kapalı kullanımda**
+> (`PUBLIC_BASE_URL` loopback — `localhost`/`127.x`/`::1` — **veya**
+> `WSIGN_RETURN_MODE=post`) `callbackUrl` **hiç gönderilmez**: webhook loopback'e
+> ulaşamaz ve `post` modunda zaten gereksizdir. Bu durumda entegratör kaydınızda
+> **callback allowlist gerekmez** — yalnızca redirect allowlist'e `localhost`
+> ekleyin. Webhook'u (push güvenlik ağı) gerçekten denemek isterseniz
+> `PUBLIC_BASE_URL`'i **public** bir adrese (tünel: `cloudflared` / `ngrok`) ayarlayın;
+> o zaman `callbackUrl` otomatik gönderilir.
 
 ## Güvenlik
 

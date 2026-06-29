@@ -21,10 +21,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Form, Request
@@ -66,6 +68,28 @@ PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
 # otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
 RETURN_MODE = env("WSIGN_RETURN_MODE", "redirect")
 
+
+def _is_loopback_host(base_url: str) -> bool:
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host == "":
+        return True  # ayrıştırılamadı → güvenli taraf: webhook gönderme
+    if host == "localhost" or host.endswith(".localhost") or host == "0.0.0.0":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+# Webhook (callbackUrl) yalnızca GERÇEKTEN ulaşılabilir + gerekli olduğunda
+# gönderilir. İki durumda hiç gönderilmez:
+#   • returnMode=post → kapalı sistem; sonuç tarayıcı-POST'u ile gelir, webhook
+#     gereksiz.
+#   • PUBLIC_BASE_URL loopback (localhost/127.x/::1/0.0.0.0) → W.Sign bu adrese
+#     POST atamaz; backend ayrıca callback'i loopback/SSRF gerekçesiyle reddeder.
+# successRedirectUrl HER ZAMAN gönderilir (redirect + post bunu kullanır).
+SEND_CALLBACK = RETURN_MODE.lower() != "post" and not _is_loopback_host(PUBLIC_BASE_URL)
+
 app = FastAPI(title="W.Sign entegrasyon örneği")
 
 # --- Basit in-memory oturum deposu (üretimde: veritabanı). ---
@@ -99,7 +123,6 @@ async def sign(belgeMetni: str = Form("")):
         "documentName": document_name,
         "signatureProfile": "CAdES-BES",
         "digestAlgorithm": "SHA256",
-        "callbackUrl": f"{PUBLIC_BASE_URL}/wsign/callback",
         "successRedirectUrl": f"{PUBLIC_BASE_URL}/imza/tamam",
         "cancelRedirectUrl": f"{PUBLIC_BASE_URL}/imza/iptal",
         "nonce": nonce,
@@ -110,6 +133,11 @@ async def sign(belgeMetni: str = Form("")):
         # döndürür ve sonucu biz pull ederiz.
         "returnMode": RETURN_MODE,
     }
+
+    # Webhook güvenlik ağı yalnızca ulaşılabilir + gerekli olduğunda eklenir
+    # (aksi halde callbackUrl hiç gönderilmez; bkz. SEND_CALLBACK).
+    if SEND_CALLBACK:
+        payload["callbackUrl"] = f"{PUBLIC_BASE_URL}/wsign/callback"
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:

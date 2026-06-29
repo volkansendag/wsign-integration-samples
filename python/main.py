@@ -62,6 +62,9 @@ API_BASE = env("WSIGN_API_BASE", "https://api.sign.wsoft.tr").rstrip("/")
 API_KEY = env("WSIGN_API_KEY", "demo-REPLACE-ME")
 CALLBACK_SECRET = env("WSIGN_CALLBACK_SECRET", "demo-callback-secret-REPLACE-ME").encode()
 PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
+# Sonuç teslim modu: "redirect" (vsy; 302 + pull) | "post" (tarayıcı-aracılı
+# otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
+RETURN_MODE = env("WSIGN_RETURN_MODE", "redirect")
 
 app = FastAPI(title="W.Sign entegrasyon örneği")
 
@@ -102,6 +105,10 @@ async def sign(belgeMetni: str = Form("")):
         "nonce": nonce,
         "ttlMinutes": 15,
         "metadata": {"talepNo": f"A-{secrets.randbelow(9000) + 1000}"},
+        # Teslim modu. "post" ise W.Sign sonucu successRedirectUrl'e tarayıcı
+        # otomatik-POST formu ile gönderir (kapalı sistem); "redirect" ise 302
+        # döndürür ve sonucu biz pull ederiz.
+        "returnMode": RETURN_MODE,
     }
 
     try:
@@ -161,6 +168,54 @@ async def result(session: str = ""):
             pass  # pull başarısızsa callback güvenlik ağı devreye girer; yine de göster
 
     return HTMLResponse(page_result(session, rec))
+
+
+# ---------------------------------------------------------------------------
+# 3b) Sonuç sayfası (successRedirectUrl) — returnMode=post: tarayıcı-aracılı POST
+#
+# KAPALI SİSTEM için. returnMode "post" ile oturum açıldıysa, kullanıcı imzayı
+# bitirince W.Sign sonucu BU adrese tarayıcının otomatik-gönderdiği bir POST
+# formu (application/x-www-form-urlencoded) ile teslim eder — backend'in dışarı
+# çıkıp pull yapmasına veya inbound webhook almasına gerek kalmadan.
+#
+# Form alanları: sessionId, status, nonce, metadata, completedAt,
+# signedContentBase64, signerCertificateBase64, payload, signature.
+# TEK doğruluk kaynağı `payload` (webhook callback gövdesiyle BİREBİR aynı JSON);
+# `signature` = "sha256=<hex>" = HMAC-SHA256(hmacSecret, payload) = webhook'taki
+# X-WSign-Signature ile aynı. Doğrulama callback ile AYNI (verify_hmac + nonce);
+# tek fark imza header'da değil `signature` form alanında, HMAC da `payload`
+# form alanının ham metni üzerinde.
+# ---------------------------------------------------------------------------
+@app.post("/imza/tamam", response_class=HTMLResponse)
+async def result_post(request: Request):
+    form = await request.form()
+    payload = str(form.get("payload") or "")
+    signature = str(form.get("signature") or "")
+    if not payload:
+        return HTMLResponse(page_error("POST teslimatında 'payload' alanı yok."), status_code=400)
+
+    # KRİTİK: HMAC `payload` alanının ham byte'ları üzerinde hesaplanır.
+    if not verify_hmac(payload.encode(), signature, CALLBACK_SECRET):
+        return HTMLResponse(page_error("İmza doğrulanamadı (HMAC uyuşmuyor)."), status_code=401)
+
+    try:
+        cb = json.loads(payload)
+    except ValueError:
+        return HTMLResponse(page_error("Geçersiz payload JSON."), status_code=400)
+
+    session_id = cb.get("sessionId")
+    if not session_id:
+        return HTMLResponse(page_error("payload içinde sessionId yok."), status_code=400)
+
+    rec = sessions.get(session_id)
+    if rec is None:
+        return HTMLResponse(page_error("Oturum bulunamadı."))
+
+    # nonce doğrulaması + idempotent uygulama (pull + callback ile ortak).
+    if not apply_result(rec, cb):
+        return HTMLResponse(page_error("nonce uyuşmuyor."), status_code=401)
+
+    return HTMLResponse(page_result(session_id, rec))
 
 
 # ---------------------------------------------------------------------------

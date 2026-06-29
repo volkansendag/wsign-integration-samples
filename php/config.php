@@ -38,6 +38,9 @@ return [
     'api_base'        => rtrim(env('WSIGN_API_BASE', 'https://api.sign.wsoft.tr'), '/'),
     'api_key'         => env('WSIGN_API_KEY', 'demo-REPLACE-ME'),
     'callback_secret' => env('WSIGN_CALLBACK_SECRET', 'demo-callback-secret-REPLACE-ME'),
+    // Sonuç teslim modu: "redirect" (vsy; 302 + pull) | "post" (tarayıcı-aracılı
+    // otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
+    'return_mode'     => env('WSIGN_RETURN_MODE', 'redirect'),
     'public_base_url' => rtrim(env('PUBLIC_BASE_URL', 'http://localhost:8080'), '/'),
     'storage_dir'     => __DIR__ . '/storage',
 ];

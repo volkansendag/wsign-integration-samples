@@ -18,6 +18,12 @@ ağı.
 İkisi birbirini tamamlar. Hiçbiri tek başına her senaryoyu kapsamaz; bu yüzden
 üretimde **ikisi birden** önerilir.
 
+> **Üçüncü bir durum — kapalı sistem:** backend **ne pull** (dışarı çıkış kapalı)
+> **ne de webhook** (içeri giriş kapalı) yapabiliyorsa, oturumu `returnMode=post`
+> ile açın. W.Sign sonucu kullanıcının tarayıcısı üzerinden bir otomatik-POST
+> formuyla `successRedirectUrl`'e teslim eder (3D-Secure `termUrl` gibi). Tüm
+> modların karşılaştırması ve `post` ayrıntısı: [`delivery-modes.md`](delivery-modes.md).
+
 ---
 
 ## Pull (birincil akış)

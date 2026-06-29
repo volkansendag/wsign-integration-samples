@@ -50,6 +50,8 @@ if ($method === 'GET' && $path === '/') {
     handle_callback($cfg);
 } elseif ($method === 'GET' && $path === '/imza/tamam') {
     handle_result($cfg);
+} elseif ($method === 'POST' && $path === '/imza/tamam') {
+    handle_result_post($cfg);
 } elseif ($method === 'GET' && $path === '/imza/indir') {
     handle_download($cfg);
 } elseif ($method === 'GET' && $path === '/imza/iptal') {
@@ -87,6 +89,10 @@ function handle_sign(array $cfg): void
         'nonce'              => $nonce,
         'ttlMinutes'         => 15,
         'metadata'           => ['talepNo' => 'A-' . random_int(1000, 9999)],
+        // Teslim modu. "post" ise W.Sign sonucu successRedirectUrl'e tarayıcı
+        // otomatik-POST formu ile gönderir (kapalı sistem); "redirect" ise 302
+        // döndürür ve sonucu biz pull ederiz.
+        'returnMode'         => $cfg['return_mode'],
     ];
 
     [$status, $body] = http_post_json(
@@ -150,6 +156,63 @@ function handle_result(array $cfg): void
     }
 
     echo page_result($sessionId, $rec);
+}
+
+// ---------------------------------------------------------------------------
+// 3b) Sonuç sayfası (successRedirectUrl) — returnMode=post: tarayıcı-aracılı POST
+//
+// KAPALI SİSTEM için. returnMode "post" ile oturum açıldıysa, kullanıcı imzayı
+// bitirince W.Sign sonucu BU adrese tarayıcının otomatik-gönderdiği bir POST
+// formu (application/x-www-form-urlencoded) ile teslim eder — backend'in dışarı
+// çıkıp pull yapmasına veya inbound webhook almasına gerek kalmadan.
+//
+// Form alanları: sessionId, status, nonce, metadata, completedAt,
+// signedContentBase64, signerCertificateBase64, payload, signature.
+// TEK doğruluk kaynağı `payload` (webhook callback gövdesiyle BİREBİR aynı JSON);
+// `signature` = "sha256=<hex>" = HMAC-SHA256(hmacSecret, payload) = webhook'taki
+// X-WSign-Signature ile aynı. Doğrulama callback ile AYNI (verify_hmac + nonce);
+// tek fark imza header'da değil `signature` form alanında, HMAC da `payload`
+// form alanının ham metni üzerinde.
+// ---------------------------------------------------------------------------
+function handle_result_post(array $cfg): void
+{
+    $payload   = $_POST['payload'] ?? '';
+    $signature = $_POST['signature'] ?? '';
+    if ($payload === '') {
+        http_response_code(400);
+        echo page_error("POST teslimatında 'payload' alanı yok.");
+        return;
+    }
+
+    // KRİTİK: HMAC `payload` alanının ham metni üzerinde hesaplanır.
+    if (!verify_hmac((string) $payload, (string) $signature, $cfg['callback_secret'])) {
+        http_response_code(401);
+        echo page_error('İmza doğrulanamadı (HMAC uyuşmuyor).');
+        return;
+    }
+
+    $cb = json_decode((string) $payload, true);
+    if (!is_array($cb) || empty($cb['sessionId'])) {
+        http_response_code(400);
+        echo page_error('payload içinde sessionId yok.');
+        return;
+    }
+
+    $rec = store_load($cfg, $cb['sessionId']);
+    if ($rec === null) {
+        echo page_error('Oturum bulunamadı.');
+        return;
+    }
+
+    // nonce doğrulaması + idempotent uygulama (pull + callback ile ortak).
+    if (!apply_result($rec, $cb)) {
+        http_response_code(401);
+        echo page_error('nonce uyuşmuyor.');
+        return;
+    }
+    store_save($cfg, $cb['sessionId'], $rec);
+
+    echo page_result($cb['sessionId'], $rec);
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,9 @@ string ApiBase()        => Env("WSIGN_API_BASE", "https://api.sign.wsoft.tr");
 string ApiKey()         => Env("WSIGN_API_KEY", "demo-REPLACE-ME");
 string CallbackSecret() => Env("WSIGN_CALLBACK_SECRET", "demo-callback-secret-REPLACE-ME");
 string PublicBaseUrl()  => Env("PUBLIC_BASE_URL", "http://localhost:5000").TrimEnd('/');
+// Sonuç teslim modu: "redirect" (vsy; 302 + pull) | "post" (tarayıcı-aracılı
+// otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
+string ReturnMode()     => Env("WSIGN_RETURN_MODE", "redirect");
 
 static string Env(string key, string fallback) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
@@ -104,6 +107,10 @@ app.MapPost("/sign", async (HttpRequest req) =>
         nonce,
         ttlMinutes = 15,
         metadata = new { talepNo = $"A-{Random.Shared.Next(1000, 9999)}" },
+        // Teslim modu. "post" ise W.Sign sonucu successRedirectUrl'e tarayıcı
+        // otomatik-POST formu ile gönderir (kapalı sistem). "redirect" ise 302
+        // döndürür ve sonucu biz pull ederiz. Bkz. /imza/tamam GET vs POST.
+        returnMode = ReturnMode(),
     };
 
     using var msg = new HttpRequestMessage(HttpMethod.Post, $"{ApiBase()}/v1/redirect-sign/sessions");
@@ -167,6 +174,53 @@ app.MapGet("/imza/tamam", async (string? session) =>
     }
 
     return Results.Content(Pages.Result(session, rec), "text/html; charset=utf-8");
+});
+
+// ---------------------------------------------------------------------------
+// 3b) Sonuç sayfası (successRedirectUrl) — returnMode=post: tarayıcı-aracılı POST
+//
+// KAPALI SİSTEM için. returnMode "post" ile oturum açıldıysa, kullanıcı imzayı
+// bitirince W.Sign sonucu BU adrese tarayıcının otomatik-gönderdiği bir POST
+// formu (application/x-www-form-urlencoded) ile teslim eder — backend'in dışarı
+// çıkıp pull yapmasına veya inbound webhook almasına gerek kalmadan (3D-Secure'un
+// termUrl'e POST'u gibi).
+//
+// Form alanları: sessionId, status, nonce, metadata, completedAt,
+// signedContentBase64, signerCertificateBase64, payload, signature.
+// TEK doğruluk kaynağı `payload` (webhook callback gövdesiyle BİREBİR aynı JSON);
+// `signature` = "sha256=<hex>" = HMAC-SHA256(hmacSecret, payload) = webhook'taki
+// X-WSign-Signature ile aynı. Bireysel alanlar yalnızca okunabilirlik kopyasıdır.
+// Doğrulama callback ile AYNI: HMAC + nonce; tek fark imza header'da değil,
+// `signature` form alanında ve `payload` form alanının ham metni üzerinde.
+// ---------------------------------------------------------------------------
+app.MapPost("/imza/tamam", async (HttpRequest req) =>
+{
+    var form      = await req.ReadFormAsync();
+    var payload   = form["payload"].ToString();
+    var signature = form["signature"].ToString();
+    if (string.IsNullOrEmpty(payload))
+        return Results.Content(Pages.Error("POST teslimatında 'payload' alanı yok."), "text/html; charset=utf-8");
+
+    // KRİTİK: HMAC `payload` alanının ham byte'ları üzerinde hesaplanır (callback
+    // ile aynı VerifyHmac mantığı; imza `signature` form alanından gelir).
+    if (!VerifyHmac(Encoding.UTF8.GetBytes(payload), signature, Encoding.UTF8.GetBytes(CallbackSecret())))
+        return Results.Content(Pages.Error("İmza doğrulanamadı (HMAC uyuşmuyor)."), "text/html; charset=utf-8");
+
+    CallbackBody? cb;
+    try { cb = JsonSerializer.Deserialize<CallbackBody>(payload, jsonOpts); }
+    catch { return Results.Content(Pages.Error("Geçersiz payload JSON."), "text/html; charset=utf-8"); }
+    if (cb is null || string.IsNullOrEmpty(cb.SessionId))
+        return Results.Content(Pages.Error("payload içinde sessionId yok."), "text/html; charset=utf-8");
+
+    if (!sessions.TryGetValue(cb.SessionId, out var rec))
+        return Results.Content(Pages.Error("Oturum bulunamadı."), "text/html; charset=utf-8");
+
+    // nonce doğrulaması + idempotent uygulama (pull + callback ile ortak).
+    if (!ApplyResult(rec, cb.Status, cb.Nonce, cb.SignedContentBase64, cb.SignerCertificateBase64, cb.CompletedAt,
+            cb.ContentType, cb.FileExtension))
+        return Results.Content(Pages.Error("nonce uyuşmuyor."), "text/html; charset=utf-8");
+
+    return Results.Content(Pages.Result(cb.SessionId, rec), "text/html; charset=utf-8");
 });
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,12 @@ W.Sign ile e-imza entegrasyonunun **ne kadar basit** olduğunu gösteren resmi
 Push vs pull ayrıntısı: [`docs/push-vs-pull.md`](docs/push-vs-pull.md).
 Daha ayrıntılı diyagram: [`docs/sequence.md`](docs/sequence.md).
 
+> **Kapalı sistem mi?** Backend ne dışarı çıkıp pull yapabiliyor ne de içeriden
+> webhook alabiliyorsa, oturumu `WSIGN_RETURN_MODE=post` ile açın: W.Sign sonucu
+> kullanıcının tarayıcısı üzerinden bir otomatik-POST formuyla
+> `successRedirectUrl`'e teslim eder (3D-Secure `termUrl`'e POST gibi). Tüm teslim
+> modları ve `post` doğrulaması: [`docs/delivery-modes.md`](docs/delivery-modes.md).
+
 ## Bu depo neyi içerir, neyi içermez
 
 | İçerir | İçermez |
@@ -108,7 +114,8 @@ Her dilin kendi README'sinde ayrıntı vardır: [dotnet](dotnet/README.md) ·
 |---|---|---|
 | `WSIGN_API_BASE` | Redirect-Session REST API kök adresi | `https://api.sign.wsoft.tr` |
 | `WSIGN_API_KEY` | Entegratör API anahtarı (`X-WSign-Api-Key`) | `demo-...` (placeholder) |
-| `WSIGN_CALLBACK_SECRET` | Callback HMAC secret'ı | `demo-...` (placeholder) |
+| `WSIGN_CALLBACK_SECRET` | Callback/POST HMAC secret'ı | `demo-...` (placeholder) |
+| `WSIGN_RETURN_MODE` | Sonuç teslim modu: `redirect` (vsy) \| `post` (kapalı sistem) | `redirect` |
 | `PUBLIC_BASE_URL` | Bu örneğin dışarıdan erişilebilir kök adresi | `http://localhost:5000` |
 
 > **Hosted demo:** Kurulumsuz denemek için bir **demo entegratör anahtarı yakında**

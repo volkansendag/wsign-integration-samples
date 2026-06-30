@@ -41,6 +41,9 @@ return [
     // Sonuç teslim modu: "redirect" (vsy; 302 + pull) | "post" (tarayıcı-aracılı
     // otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
     'return_mode'     => env('WSIGN_RETURN_MODE', 'redirect'),
+    // İmza tipi varsayılanı: formda seçim yoksa bu kullanılır.
+    // CAdES-BES | CAdES-T | XAdES-BES | XAdES-T. Bkz. docs/signature-profiles.md.
+    'signature_profile' => env('WSIGN_SIGNATURE_PROFILE', 'CAdES-BES'),
     'public_base_url' => rtrim(env('PUBLIC_BASE_URL', 'http://localhost:8080'), '/'),
     'storage_dir'     => __DIR__ . '/storage',
 ];

@@ -68,6 +68,26 @@ PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
 # otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
 RETURN_MODE = env("WSIGN_RETURN_MODE", "redirect")
 
+# Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
+ALLOWED_PROFILES = ["CAdES-BES", "CAdES-T", "XAdES-BES", "XAdES-T"]
+
+
+def normalize_profile(value: str | None) -> str:
+    """Gelen değeri izin verilen listeyle eşle; tanınmazsa güvenli varsayılan CAdES-BES."""
+    for p in ALLOWED_PROFILES:
+        if p.casefold() == (value or "").casefold():
+            return p
+    return "CAdES-BES"
+
+
+def is_timestamped(profile: str | None) -> bool:
+    """Profil zaman damgalı mı? ("-T" ile biter → CAdES-T / XAdES-T)"""
+    return bool(profile) and profile.upper().endswith("-T")
+
+
+# İmza tipi varsayılanı: formda seçim yoksa bu kullanılır. Bkz. docs/signature-profiles.md.
+DEFAULT_PROFILE = normalize_profile(env("WSIGN_SIGNATURE_PROFILE", "CAdES-BES"))
+
 
 def _is_loopback_host(base_url: str) -> bool:
     host = (urlsplit(base_url).hostname or "").lower()
@@ -101,19 +121,24 @@ sessions: dict[str, dict] = {}
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def form() -> str:
-    return page_form()
+    return page_form(DEFAULT_PROFILE)
 
 
 # ---------------------------------------------------------------------------
 # 2) "İmzala" -> oturum oluştur -> 302 yönlendir
 # ---------------------------------------------------------------------------
 @app.post("/sign")
-async def sign(belgeMetni: str = Form("")):
+async def sign(belgeMetni: str = Form(""), signatureProfile: str = Form("")):
     text = belgeMetni.strip()
     if not text:
         return HTMLResponse(page_error("Belge metni boş olamaz."), status_code=400)
 
     document_name = f"OrnekBelediye_Belge_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.txt"
+
+    # İmza tipini formdan al; tanınmazsa env varsayılanına düş. "-T" seçilirse
+    # server, entegratörde Kamu SM TSA tanımlı değilse 400 (TSA_NOT_CONFIGURED)
+    # döner — aşağıda yakalanır.
+    profile = normalize_profile(signatureProfile or DEFAULT_PROFILE)
 
     # CSRF/replay koruması: rastgele nonce. Callback'te aynen geri gelecek.
     nonce = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -121,7 +146,7 @@ async def sign(belgeMetni: str = Form("")):
     payload = {
         "documentBase64": base64.b64encode(text.encode()).decode(),
         "documentName": document_name,
-        "signatureProfile": "CAdES-BES",
+        "signatureProfile": profile,
         "digestAlgorithm": "SHA256",
         "successRedirectUrl": f"{PUBLIC_BASE_URL}/imza/tamam",
         "cancelRedirectUrl": f"{PUBLIC_BASE_URL}/imza/iptal",
@@ -150,6 +175,12 @@ async def sign(belgeMetni: str = Form("")):
         return HTMLResponse(page_error(f"W.Sign sunucusuna ulaşılamadı: {ex}"))
 
     if resp.status_code // 100 != 2:
+        # Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        if resp.status_code == 400 and "TSA_NOT_CONFIGURED" in resp.text.upper():
+            return HTMLResponse(page_error(
+                "Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA "
+                "tanımlayın veya damgasız (BES) bir tip seçin."
+            ))
         return HTMLResponse(page_error(f"Oturum oluşturulamadı ({resp.status_code}): {resp.text}"))
 
     created = resp.json()
@@ -157,10 +188,13 @@ async def sign(belgeMetni: str = Form("")):
         return HTMLResponse(page_error("W.Sign yanıtı beklenmedik biçimde."))
 
     # nonce'u sessionId ile eşleştir; callback geldiğinde doğrulayacağız.
+    # Talep edilen imza tipini de saklarız (sonuç sayfasında göstermek için;
+    # sonuç/callback server'ın belirlediği değeri döndürürse onunla güncellenir).
     sessions[created["sessionId"]] = {
         "nonce": nonce,
         "documentName": document_name,
         "status": "pending",
+        "signatureProfile": profile,
     }
 
     # 3D-Secure gibi: kullanıcıyı W.Sign imzalama sayfasına yönlendir.
@@ -333,6 +367,9 @@ def apply_result(rec: dict, data: dict) -> bool:
         rec["contentType"] = data["contentType"]
     if data.get("fileExtension"):
         rec["fileExtension"] = data["fileExtension"]
+    # Server sonucu/callback imza tipini döndürürse onu otoriter kabul et.
+    if data.get("signatureProfile"):
+        rec["signatureProfile"] = data["signatureProfile"]
     return True
 
 
@@ -364,13 +401,24 @@ HEAD = """
 """
 
 
-def page_form() -> str:
+def page_form(default_profile: str) -> str:
+    options = "\n      ".join(
+        f'<option value="{p}"{" selected" if p == default_profile else ""}>{p}</option>'
+        for p in ALLOWED_PROFILES
+    )
     return f"""<!doctype html><html lang="tr"><head>{HEAD}</head><body>
     <h1>Örnek Belediye — Belge İmzalama</h1>
     <p>Aşağıya imzalanacak belge metnini girin. "İmzala" dediğinizde W.Sign
     imzalama sayfasına (3D-Secure gibi) yönlendirileceksiniz.</p>
     <form method="post" action="/sign">
       <textarea name="belgeMetni" placeholder="Belge metni...">Örnek Belediye resmi yazısı. Bu belge W.Sign ile elektronik imzalanacaktır.</textarea>
+      <p>
+        <label for="signatureProfile"><b>İmza tipi</b></label><br>
+        <select name="signatureProfile" id="signatureProfile">
+      {options}
+        </select>
+        <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+      </p>
       <p><button type="submit">İmzala</button></p>
     </form>
     </body></html>"""
@@ -381,13 +429,25 @@ def page_result(session_id: str, rec: dict) -> str:
 
     status = rec.get("status", "unknown")
     status_class = "ok" if status == "completed" else "err"
+    # İmza tipi (CAdES/XAdES, BES/-T) + zaman damgalı bilgisi + içerik türü.
+    profile = rec.get("signatureProfile") or ""
+    file_ext = rec.get("fileExtension") or ".p7s"
+    profile_line = (
+        f'<p>İmza tipi: <code>{escape(profile)}</code> '
+        f'({"zaman damgalı" if is_timestamped(profile) else "damgasız"})</p>'
+        if profile else ""
+    )
+    content_type_line = (
+        f'<p>İçerik türü: <code>{escape(rec.get("contentType") or "")}</code></p>'
+        if rec.get("contentType") else ""
+    )
     signed_raw = rec.get("signedContentBase64") or ""
     if signed_raw:
         trunc = signed_raw[:120] + "…" if len(signed_raw) > 120 else signed_raw
         signed = (
-            f'<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{escape(trunc)}</div>'
+            f'<div class="box"><b>İmzalı içerik (base64):</b><br>{escape(trunc)}</div>'
             f'<p><a href="/imza/indir?session={escape(session_id)}">'
-            f'<button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>'
+            f'<button type="button">İmzalı dosyayı indir ({escape(file_ext)})</button></a></p>'
         )
     else:
         signed = "<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>"
@@ -396,6 +456,8 @@ def page_result(session_id: str, rec: dict) -> str:
     <p>Oturum: <code>{escape(session_id)}</code></p>
     <p>Durum: <span class="{status_class}">{escape(status)}</span></p>
     <p>Belge: {escape(rec.get("documentName", ""))}</p>
+    {profile_line}
+    {content_type_line}
     {signed}
     <p><a href="/">← Yeni belge imzala</a></p>
     </body></html>"""

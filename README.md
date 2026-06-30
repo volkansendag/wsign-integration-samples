@@ -115,8 +115,17 @@ Her dilin kendi README'sinde ayrıntı vardır: [dotnet](dotnet/README.md) ·
 | `WSIGN_API_BASE` | Redirect-Session REST API kök adresi | `https://api.sign.wsoft.tr` |
 | `WSIGN_API_KEY` | Entegratör API anahtarı (`X-WSign-Api-Key`) | `demo-...` (placeholder) |
 | `WSIGN_CALLBACK_SECRET` | Callback/POST HMAC secret'ı | `demo-...` (placeholder) |
+| `WSIGN_SIGNATURE_PROFILE` | İmza tipi varsayılanı: `CAdES-BES` \| `CAdES-T` \| `XAdES-BES` \| `XAdES-T` | `CAdES-BES` |
 | `WSIGN_RETURN_MODE` | Sonuç teslim modu: `redirect` (vsy) \| `post` (kapalı sistem) | `redirect` |
 | `PUBLIC_BASE_URL` | Bu örneğin dışarıdan erişilebilir kök adresi | `http://localhost:5000` |
+
+> **İmza tipi seçimi (CAdES/XAdES, BES/-T):** İmzalama formundaki "İmza tipi"
+> açılır listesinden `CAdES-BES` / `CAdES-T` / `XAdES-BES` / `XAdES-T` seçilir ve
+> create isteğine `signatureProfile` olarak geçer. `-T` (zaman damgalı) için
+> entegratörde **Kamu SM TSA** tanımlı olmalıdır; değilse server `400`
+> (`TSA_NOT_CONFIGURED`) döner ve örnek bunu kullanıcıya açıklar. İmzalı çıktının
+> içerik türü/uzantısı profile göre değişir (CAdES → `.p7s`, XAdES → `.xml`).
+> Ayrıntı: [`docs/signature-profiles.md`](docs/signature-profiles.md).
 
 > **Hosted demo:** Kurulumsuz denemek için bir **demo entegratör anahtarı yakında**
 > yayınlanacaktır (`api.sign.wsoft.tr` üzerinde sandbox tenant). O zamana kadar

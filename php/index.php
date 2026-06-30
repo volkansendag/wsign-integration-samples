@@ -25,6 +25,26 @@ $cfg = require __DIR__ . '/config.php';
 $path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
+// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
+const ALLOWED_PROFILES = ['CAdES-BES', 'CAdES-T', 'XAdES-BES', 'XAdES-T'];
+
+// Gelen değeri izin verilen listeyle eşle; tanınmazsa güvenli varsayılan CAdES-BES.
+function normalize_profile(?string $value): string
+{
+    foreach (ALLOWED_PROFILES as $p) {
+        if (strcasecmp($p, (string) $value) === 0) {
+            return $p;
+        }
+    }
+    return 'CAdES-BES';
+}
+
+// Profil zaman damgalı mı? ("-T" ile biter → CAdES-T / XAdES-T)
+function is_timestamped(?string $profile): bool
+{
+    return $profile !== null && str_ends_with(strtoupper($profile), '-T');
+}
+
 // --- Basit dosya tabanlı oturum deposu (üretimde: veritabanı). ---
 function store_path(array $cfg, string $sessionId): string
 {
@@ -43,7 +63,7 @@ function store_load(array $cfg, string $sessionId): ?array
 
 // --- Yönlendirici ---
 if ($method === 'GET' && $path === '/') {
-    echo page_form();
+    echo page_form(normalize_profile($cfg['signature_profile']));
 } elseif ($method === 'POST' && $path === '/sign') {
     handle_sign($cfg);
 } elseif ($method === 'POST' && $path === '/wsign/callback') {
@@ -75,13 +95,20 @@ function handle_sign(array $cfg): void
 
     $documentName = 'OrnekBelediye_Belge_' . gmdate('Ymd_His') . '.txt';
 
+    // İmza tipini formdan al; tanınmazsa env varsayılanına düş. "-T" seçilirse
+    // server, entegratörde Kamu SM TSA tanımlı değilse 400 (TSA_NOT_CONFIGURED)
+    // döner — aşağıda yakalanır.
+    $signatureProfile = normalize_profile(
+        ($_POST['signatureProfile'] ?? '') !== '' ? (string) $_POST['signatureProfile'] : (string) $cfg['signature_profile']
+    );
+
     // CSRF/replay koruması: rastgele nonce. Callback'te aynen geri gelecek.
     $nonce = base64_encode(random_bytes(16));
 
     $payload = [
         'documentBase64'     => base64_encode($text),
         'documentName'       => $documentName,
-        'signatureProfile'   => 'CAdES-BES',
+        'signatureProfile'   => $signatureProfile,
         'digestAlgorithm'    => 'SHA256',
         'successRedirectUrl' => $cfg['public_base_url'] . '/imza/tamam',
         'cancelRedirectUrl'  => $cfg['public_base_url'] . '/imza/iptal',
@@ -113,6 +140,12 @@ function handle_sign(array $cfg): void
     );
 
     if ($status < 200 || $status >= 300) {
+        // Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        if ($status === 400 && stripos((string) $body, 'TSA_NOT_CONFIGURED') !== false) {
+            echo page_error('Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA '
+                . 'tanımlayın veya damgasız (BES) bir tip seçin.');
+            return;
+        }
         echo page_error("Oturum oluşturulamadı ($status): " . htmlspecialchars((string) $body));
         return;
     }
@@ -124,10 +157,13 @@ function handle_sign(array $cfg): void
     }
 
     // nonce'u sessionId ile eşleştir; callback geldiğinde doğrulayacağız.
+    // Talep edilen imza tipini de saklarız (sonuç sayfasında göstermek için;
+    // sonuç/callback server'ın belirlediği değeri döndürürse onunla güncellenir).
     store_save($cfg, $created['sessionId'], [
-        'nonce'        => $nonce,
-        'documentName' => $documentName,
-        'status'       => 'pending',
+        'nonce'            => $nonce,
+        'documentName'     => $documentName,
+        'status'           => 'pending',
+        'signatureProfile' => $signatureProfile,
     ]);
 
     // 3D-Secure gibi: kullanıcıyı W.Sign imzalama sayfasına yönlendir.
@@ -316,6 +352,8 @@ function apply_result(array &$rec, array $data): bool
     if (!empty($data['completedAt']))             $rec['completedAt'] = $data['completedAt'];
     if (!empty($data['contentType']))             $rec['contentType'] = $data['contentType'];
     if (!empty($data['fileExtension']))           $rec['fileExtension'] = $data['fileExtension'];
+    // Server sonucu/callback imza tipini döndürürse onu otoriter kabul et.
+    if (!empty($data['signatureProfile']))        $rec['signatureProfile'] = $data['signatureProfile'];
     return true;
 }
 
@@ -407,9 +445,14 @@ function html_head(): string
     HTML;
 }
 
-function page_form(): string
+function page_form(string $defaultProfile): string
 {
     $head = html_head();
+    $options = '';
+    foreach (ALLOWED_PROFILES as $p) {
+        $sel = ($p === $defaultProfile) ? ' selected' : '';
+        $options .= '<option value="' . htmlspecialchars($p) . '"' . $sel . '>' . htmlspecialchars($p) . "</option>\n      ";
+    }
     return <<<HTML
     <!doctype html><html lang="tr"><head>{$head}</head><body>
     <h1>Örnek Belediye — Belge İmzalama</h1>
@@ -417,6 +460,12 @@ function page_form(): string
     imzalama sayfasına (3D-Secure gibi) yönlendirileceksiniz.</p>
     <form method="post" action="/sign">
       <textarea name="belgeMetni" placeholder="Belge metni...">Örnek Belediye resmi yazısı. Bu belge W.Sign ile elektronik imzalanacaktır.</textarea>
+      <p>
+        <label for="signatureProfile"><b>İmza tipi</b></label><br>
+        <select name="signatureProfile" id="signatureProfile">
+      {$options}</select>
+        <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+      </p>
       <p><button type="submit">İmzala</button></p>
     </form>
     </body></html>
@@ -430,11 +479,22 @@ function page_result(string $sessionId, array $rec): string
     $status      = htmlspecialchars($rec['status'] ?? 'unknown');
     $statusClass = ($rec['status'] ?? '') === 'completed' ? 'ok' : 'err';
     $docName     = htmlspecialchars($rec['documentName'] ?? '');
+    // İmza tipi (CAdES/XAdES, BES/-T) + zaman damgalı bilgisi + içerik türü.
+    $profile     = (string) ($rec['signatureProfile'] ?? '');
+    $fileExt     = !empty($rec['fileExtension']) ? (string) $rec['fileExtension'] : '.p7s';
+    $profileLine = $profile !== ''
+        ? '<p>İmza tipi: <code>' . htmlspecialchars($profile) . '</code> ('
+            . (is_timestamped($profile) ? 'zaman damgalı' : 'damgasız') . ')</p>'
+        : '';
+    $contentTypeLine = !empty($rec['contentType'])
+        ? '<p>İçerik türü: <code>' . htmlspecialchars((string) $rec['contentType']) . '</code></p>'
+        : '';
     $signedRaw   = $rec['signedContentBase64'] ?? '';
     if ($signedRaw !== '') {
         $trunc  = strlen($signedRaw) > 120 ? substr($signedRaw, 0, 120) . '…' : $signedRaw;
-        $signed = '<div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>' . htmlspecialchars($trunc) . '</div>'
-            . '<p><a href="/imza/indir?session=' . rawurlencode($sessionId) . '"><button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>';
+        $signed = '<div class="box"><b>İmzalı içerik (base64):</b><br>' . htmlspecialchars($trunc) . '</div>'
+            . '<p><a href="/imza/indir?session=' . rawurlencode($sessionId) . '"><button type="button">İmzalı dosyayı indir ('
+            . htmlspecialchars($fileExt) . ')</button></a></p>';
     } else {
         $signed = '<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>';
     }
@@ -444,6 +504,8 @@ function page_result(string $sessionId, array $rec): string
     <p>Oturum: <code>{$sid}</code></p>
     <p>Durum: <span class="{$statusClass}">{$status}</span></p>
     <p>Belge: {$docName}</p>
+    {$profileLine}
+    {$contentTypeLine}
     {$signed}
     <p><a href="/">← Yeni belge imzala</a></p>
     </body></html>

@@ -35,9 +35,23 @@ string PublicBaseUrl()  => Env("PUBLIC_BASE_URL", "http://localhost:5000").TrimE
 // Sonuç teslim modu: "redirect" (vsy; 302 + pull) | "post" (tarayıcı-aracılı
 // otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
 string ReturnMode()     => Env("WSIGN_RETURN_MODE", "redirect");
+// İmza tipi varsayılanı: formda seçim yoksa bu kullanılır. Bkz. docs/signature-profiles.md.
+string DefaultProfile() => NormalizeProfile(Env("WSIGN_SIGNATURE_PROFILE", "CAdES-BES"));
 
 static string Env(string key, string fallback) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
+
+// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
+static string[] AllProfiles() => ["CAdES-BES", "CAdES-T", "XAdES-BES", "XAdES-T"];
+
+// Gelen değeri izin verilen listeyle eşle; tanınmazsa güvenli varsayılan CAdES-BES.
+static string NormalizeProfile(string? value)
+{
+    foreach (var p in AllProfiles())
+        if (string.Equals(p, value, StringComparison.OrdinalIgnoreCase))
+            return p;
+    return "CAdES-BES";
+}
 
 // Webhook (callbackUrl) yalnızca GERÇEKTEN ulaşılabilir + gerekli olduğunda
 // gönderilir. İki durumda hiç gönderilmez:
@@ -103,7 +117,7 @@ var jsonOpts = new JsonSerializerOptions
 // ---------------------------------------------------------------------------
 // 1) Belge oluşturma formu
 // ---------------------------------------------------------------------------
-app.MapGet("/", () => Results.Content(Pages.Form(), "text/html; charset=utf-8"));
+app.MapGet("/", () => Results.Content(Pages.Form(AllProfiles(), DefaultProfile()), "text/html; charset=utf-8"));
 
 // ---------------------------------------------------------------------------
 // 2) "İmzala" → oturum oluştur → 302 yönlendir
@@ -117,6 +131,12 @@ app.MapPost("/sign", async (HttpRequest req) =>
 
     var documentName = $"OrnekBelediye_Belge_{DateTime.UtcNow:yyyyMMdd_HHmmss}.txt";
 
+    // İmza tipini formdan al; tanınmazsa env varsayılanına düş (NormalizeProfile
+    // izin verilen 4 değerle eşler). "-T" seçilirse server, entegratörde Kamu SM
+    // TSA tanımlı değilse 400 (TSA_NOT_CONFIGURED) döner — aşağıda yakalanır.
+    var signatureProfile = NormalizeProfile(
+        form["signatureProfile"].ToString() is { Length: > 0 } sp ? sp : DefaultProfile());
+
     // CSRF/replay koruması: rastgele nonce. Callback'te aynen geri gelecek.
     var nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(16));
 
@@ -124,7 +144,7 @@ app.MapPost("/sign", async (HttpRequest req) =>
     {
         documentBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(text)),
         documentName,
-        signatureProfile = "CAdES-BES",
+        signatureProfile,
         digestAlgorithm = "SHA256",
         // Webhook güvenlik ağı yalnızca ulaşılabilir + gerekli olduğunda gönderilir.
         // null ise jsonOpts (WhenWritingNull) bu alanı çıktıdan tamamen atar.
@@ -151,6 +171,12 @@ app.MapPost("/sign", async (HttpRequest req) =>
     if (!resp.IsSuccessStatusCode)
     {
         var body = await resp.Content.ReadAsStringAsync();
+        // Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        if (resp.StatusCode == HttpStatusCode.BadRequest &&
+            body.Contains("TSA_NOT_CONFIGURED", StringComparison.OrdinalIgnoreCase))
+            return Results.Content(Pages.Error(
+                "Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA " +
+                "tanımlayın veya damgasız (BES) bir tip seçin."), "text/html; charset=utf-8");
         return Results.Content(Pages.Error($"Oturum oluşturulamadı ({(int)resp.StatusCode}): {body}"), "text/html; charset=utf-8");
     }
 
@@ -159,7 +185,13 @@ app.MapPost("/sign", async (HttpRequest req) =>
         return Results.Content(Pages.Error("W.Sign yanıtı beklenmedik biçimde."), "text/html; charset=utf-8");
 
     // nonce'u sessionId ile eşleştir; callback geldiğinde doğrulayacağız.
-    sessions[created.SessionId] = new SessionRecord { Nonce = nonce, DocumentName = documentName, Status = "pending" };
+    // Talep edilen imza tipini de saklarız (sonuç sayfasında göstermek için;
+    // sonuç/callback ayrıca server'ın belirlediği değeri döndürürse onunla güncellenir).
+    sessions[created.SessionId] = new SessionRecord
+    {
+        Nonce = nonce, DocumentName = documentName, Status = "pending",
+        SignatureProfile = signatureProfile,
+    };
 
     // 3D-Secure gibi: kullanıcıyı W.Sign imzalama sayfasına yönlendir.
     return Results.Redirect(created.RedirectUrl);
@@ -193,7 +225,7 @@ app.MapGet("/imza/tamam", async (string? session) =>
                 if (result is not null)
                     ApplyResult(rec, result.Status, result.Nonce,
                         result.SignedContentBase64, result.SignerCertificateBase64, result.CompletedAt,
-                        result.ContentType, result.FileExtension);
+                        result.ContentType, result.FileExtension, result.SignatureProfile);
             }
             // 404/401 vb. → henüz bizim sonucumuz yok; sayfayı mevcut durumla göster.
         }
@@ -244,7 +276,7 @@ app.MapPost("/imza/tamam", async (HttpRequest req) =>
 
     // nonce doğrulaması + idempotent uygulama (pull + callback ile ortak).
     if (!ApplyResult(rec, cb.Status, cb.Nonce, cb.SignedContentBase64, cb.SignerCertificateBase64, cb.CompletedAt,
-            cb.ContentType, cb.FileExtension))
+            cb.ContentType, cb.FileExtension, cb.SignatureProfile))
         return Results.Content(Pages.Error("nonce uyuşmuyor."), "text/html; charset=utf-8");
 
     return Results.Content(Pages.Result(cb.SessionId, rec), "text/html; charset=utf-8");
@@ -280,7 +312,7 @@ app.MapPost("/wsign/callback", async (HttpRequest req) =>
 
     // nonce doğrulaması + idempotent uygulama (pull ile ortak).
     if (!ApplyResult(rec, cb.Status, cb.Nonce, cb.SignedContentBase64, cb.SignerCertificateBase64, cb.CompletedAt,
-            cb.ContentType, cb.FileExtension))
+            cb.ContentType, cb.FileExtension, cb.SignatureProfile))
         return Results.Unauthorized();
 
     return Results.Ok(new { received = true });
@@ -319,7 +351,7 @@ app.Run();
 // Aynı sonuç ikinci kez gelse de aynı değerleri yazar → güvenle tekrar edilebilir.
 static bool ApplyResult(SessionRecord rec, string? status, string? nonce,
     string? signedContentBase64, string? signerCertificateBase64, string? completedAt,
-    string? contentType, string? fileExtension)
+    string? contentType, string? fileExtension, string? signatureProfile)
 {
     if (!FixedTimeEquals(nonce ?? "", rec.Nonce))
         return false;
@@ -329,6 +361,9 @@ static bool ApplyResult(SessionRecord rec, string? status, string? nonce,
     if (!string.IsNullOrEmpty(completedAt)) rec.CompletedAt = completedAt;
     if (!string.IsNullOrEmpty(contentType)) rec.ContentType = contentType;
     if (!string.IsNullOrEmpty(fileExtension)) rec.FileExtension = fileExtension;
+    // Server sonucu/callback imza tipini döndürürse onu otoriter kabul et (talep
+    // anında sakladığımız değerin üzerine yaz).
+    if (!string.IsNullOrEmpty(signatureProfile)) rec.SignatureProfile = signatureProfile;
     return true;
 }
 
@@ -365,6 +400,7 @@ sealed class SessionRecord
     public string? CompletedAt { get; set; }
     public string? ContentType { get; set; }   // result'tan: imzalı dosyanın MIME'ı
     public string? FileExtension { get; set; }  // result'tan: imzalı dosyanın uzantısı
+    public string? SignatureProfile { get; set; }  // CAdES-BES | CAdES-T | XAdES-BES | XAdES-T
 }
 
 sealed class CreateSessionResponse
@@ -385,6 +421,7 @@ sealed class CallbackBody
     public string? CompletedAt { get; set; }
     public string? ContentType { get; set; }
     public string? FileExtension { get; set; }
+    public string? SignatureProfile { get; set; }
     public string? ErrorReason { get; set; }
 }
 
@@ -399,6 +436,7 @@ sealed class ResultResponse
     public string? CompletedAt { get; set; }
     public string? ContentType { get; set; }   // imzalı dosyanın MIME'ı (örn. application/pkcs7-mime)
     public string? FileExtension { get; set; }  // imzalı dosyanın uzantısı (örn. .p7s)
+    public string? SignatureProfile { get; set; }  // server'ın belirlediği imza tipi (varsa)
 }
 
 // ===========================================================================
@@ -421,25 +459,47 @@ static class Pages
         </style>
         """;
 
-    public static string Form() => $"""
+    public static string Form(string[] profiles, string defaultProfile)
+    {
+        var options = string.Join("\n          ", profiles.Select(p =>
+            $"""<option value="{p}"{(p == defaultProfile ? " selected" : "")}>{p}</option>"""));
+        return $"""
         <!doctype html><html lang="tr"><head>{Head}</head><body>
         <h1>Örnek Belediye — Belge İmzalama</h1>
         <p>Aşağıya imzalanacak belge metnini girin. "İmzala" dediğinizde W.Sign
         imzalama sayfasına (3D-Secure gibi) yönlendirileceksiniz.</p>
         <form method="post" action="/sign">
           <textarea name="belgeMetni" placeholder="Belge metni...">Örnek Belediye resmi yazısı. Bu belge W.Sign ile elektronik imzalanacaktır.</textarea>
+          <p>
+            <label for="signatureProfile"><b>İmza tipi</b></label><br>
+            <select name="signatureProfile" id="signatureProfile">
+          {options}
+            </select>
+            <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+          </p>
           <p><button type="submit">İmzala</button></p>
         </form>
         </body></html>
         """;
+    }
 
     public static string Result(string sessionId, SessionRecord rec)
     {
         var statusClass = rec.Status == "completed" ? "ok" : "err";
+        // İmza tipi (CAdES/XAdES, BES/-T). Zaman damgalı mı? "-T" ile biter.
+        var timestamped = rec.SignatureProfile is not null
+            && rec.SignatureProfile.EndsWith("-T", StringComparison.OrdinalIgnoreCase);
+        var fileExt = string.IsNullOrEmpty(rec.FileExtension) ? ".p7s" : rec.FileExtension;
+        var profileLine = rec.SignatureProfile is { Length: > 0 }
+            ? $"""<p>İmza tipi: <code>{rec.SignatureProfile}</code> ({(timestamped ? "zaman damgalı" : "damgasız")})</p>"""
+            : "";
+        var contentTypeLine = rec.ContentType is { Length: > 0 }
+            ? $"<p>İçerik türü: <code>{rec.ContentType}</code></p>"
+            : "";
         var signed = rec.SignedContentBase64 is { Length: > 0 }
             ? $"""
-               <div class="box"><b>İmzalı içerik (DER CMS, base64):</b><br>{Trunc(rec.SignedContentBase64)}</div>
-               <p><a href="/imza/indir?session={sessionId}"><button type="button">İmzalı dosyayı indir (.p7s)</button></a></p>
+               <div class="box"><b>İmzalı içerik (base64):</b><br>{Trunc(rec.SignedContentBase64)}</div>
+               <p><a href="/imza/indir?session={sessionId}"><button type="button">İmzalı dosyayı indir ({fileExt})</button></a></p>
                """
             : "<p>Henüz imzalı içerik alınmadı (callback bekleniyor olabilir).</p>";
         return $"""
@@ -448,6 +508,8 @@ static class Pages
             <p>Oturum: <code>{sessionId}</code></p>
             <p>Durum: <span class="{statusClass}">{rec.Status}</span></p>
             <p>Belge: {rec.DocumentName}</p>
+            {profileLine}
+            {contentTypeLine}
             {signed}
             <p><a href="/">← Yeni belge imzala</a></p>
             </body></html>

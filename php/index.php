@@ -25,8 +25,9 @@ $cfg = require __DIR__ . '/config.php';
 $path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
-// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
-const ALLOWED_PROFILES = ['CAdES-BES', 'CAdES-T', 'XAdES-BES', 'XAdES-T'];
+// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı;
+// ESXLong = uzun dönemli imza (zaman damgası + zincir + OCSP/CRL gömülü, EBYS/arşiv için).
+const ALLOWED_PROFILES = ['CAdES-BES', 'CAdES-T', 'CAdES-ESXLong', 'XAdES-BES', 'XAdES-T'];
 
 // Gelen değeri izin verilen listeyle eşle; tanınmazsa güvenli varsayılan CAdES-BES.
 function normalize_profile(?string $value): string
@@ -39,10 +40,17 @@ function normalize_profile(?string $value): string
     return 'CAdES-BES';
 }
 
-// Profil zaman damgalı mı? ("-T" ile biter → CAdES-T / XAdES-T)
+// Profil zaman damgalı mı? ("-T" ile bitenler + uzun dönemli ESXLong)
 function is_timestamped(?string $profile): bool
 {
-    return $profile !== null && str_ends_with(strtoupper($profile), '-T');
+    return $profile !== null
+        && (str_ends_with(strtoupper($profile), '-T') || is_long_term($profile));
+}
+
+// Profil uzun dönemli mi? (CAdES-ESXLong: damga + zincir + OCSP/CRL gömülü)
+function is_long_term(?string $profile): bool
+{
+    return $profile !== null && str_contains(strtoupper($profile), 'ESXLONG');
 }
 
 // --- Basit dosya tabanlı oturum deposu (üretimde: veritabanı). ---
@@ -140,9 +148,9 @@ function handle_sign(array $cfg): void
     );
 
     if ($status < 200 || $status >= 300) {
-        // Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        // Zaman damgalı tip (-T / ESXLong) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
         if ($status === 400 && stripos((string) $body, 'TSA_NOT_CONFIGURED') !== false) {
-            echo page_error('Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA '
+            echo page_error('Zaman damgalı imza (CAdES-T/XAdES-T/CAdES-ESXLong) için entegratörde Kamu SM TSA '
                 . 'tanımlayın veya damgasız (BES) bir tip seçin.');
             return;
         }
@@ -464,7 +472,8 @@ function page_form(string $defaultProfile): string
         <label for="signatureProfile"><b>İmza tipi</b></label><br>
         <select name="signatureProfile" id="signatureProfile">
       {$options}</select>
-        <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+        <br><small>-T = zaman damgalı; ESXLong = uzun dönemli imza (damga + zincir + OCSP/CRL gömülü, EBYS/arşiv).
+        Damgalı tipler için entegratörde Kamu SM TSA tanımlı olmalı.</small>
       </p>
       <p><button type="submit">İmzala</button></p>
     </form>
@@ -479,12 +488,13 @@ function page_result(string $sessionId, array $rec): string
     $status      = htmlspecialchars($rec['status'] ?? 'unknown');
     $statusClass = ($rec['status'] ?? '') === 'completed' ? 'ok' : 'err';
     $docName     = htmlspecialchars($rec['documentName'] ?? '');
-    // İmza tipi (CAdES/XAdES, BES/-T) + zaman damgalı bilgisi + içerik türü.
+    // İmza tipi (CAdES/XAdES; BES / -T / ESXLong) + damga bilgisi + içerik türü.
     $profile     = (string) ($rec['signatureProfile'] ?? '');
     $fileExt     = !empty($rec['fileExtension']) ? (string) $rec['fileExtension'] : '.p7s';
+    $profileDesc = is_long_term($profile) ? 'uzun dönemli (zaman damgalı + zincir/OCSP/CRL gömülü)'
+        : (is_timestamped($profile) ? 'zaman damgalı' : 'damgasız');
     $profileLine = $profile !== ''
-        ? '<p>İmza tipi: <code>' . htmlspecialchars($profile) . '</code> ('
-            . (is_timestamped($profile) ? 'zaman damgalı' : 'damgasız') . ')</p>'
+        ? '<p>İmza tipi: <code>' . htmlspecialchars($profile) . '</code> (' . $profileDesc . ')</p>'
         : '';
     $contentTypeLine = !empty($rec['contentType'])
         ? '<p>İçerik türü: <code>' . htmlspecialchars((string) $rec['contentType']) . '</code></p>'

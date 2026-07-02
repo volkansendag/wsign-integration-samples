@@ -41,8 +41,9 @@ string DefaultProfile() => NormalizeProfile(Env("WSIGN_SIGNATURE_PROFILE", "CAdE
 static string Env(string key, string fallback) =>
     Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
 
-// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
-static string[] AllProfiles() => ["CAdES-BES", "CAdES-T", "XAdES-BES", "XAdES-T"];
+// Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı;
+// ESXLong = uzun dönemli imza (zaman damgası + sertifika zinciri + OCSP/CRL gömülü, EBYS/arşiv için).
+static string[] AllProfiles() => ["CAdES-BES", "CAdES-T", "CAdES-ESXLong", "XAdES-BES", "XAdES-T"];
 
 // Gelen değeri izin verilen listeyle eşle; tanınmazsa güvenli varsayılan CAdES-BES.
 static string NormalizeProfile(string? value)
@@ -171,11 +172,11 @@ app.MapPost("/sign", async (HttpRequest req) =>
     if (!resp.IsSuccessStatusCode)
     {
         var body = await resp.Content.ReadAsStringAsync();
-        // Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        // Zaman damgalı tip (-T / ESXLong) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
         if (resp.StatusCode == HttpStatusCode.BadRequest &&
             body.Contains("TSA_NOT_CONFIGURED", StringComparison.OrdinalIgnoreCase))
             return Results.Content(Pages.Error(
-                "Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA " +
+                "Zaman damgalı imza (CAdES-T/XAdES-T/CAdES-ESXLong) için entegratörde Kamu SM TSA " +
                 "tanımlayın veya damgasız (BES) bir tip seçin."), "text/html; charset=utf-8");
         return Results.Content(Pages.Error($"Oturum oluşturulamadı ({(int)resp.StatusCode}): {body}"), "text/html; charset=utf-8");
     }
@@ -400,7 +401,7 @@ sealed class SessionRecord
     public string? CompletedAt { get; set; }
     public string? ContentType { get; set; }   // result'tan: imzalı dosyanın MIME'ı
     public string? FileExtension { get; set; }  // result'tan: imzalı dosyanın uzantısı
-    public string? SignatureProfile { get; set; }  // CAdES-BES | CAdES-T | XAdES-BES | XAdES-T
+    public string? SignatureProfile { get; set; }  // CAdES-BES | CAdES-T | CAdES-ESXLong | XAdES-BES | XAdES-T
 }
 
 sealed class CreateSessionResponse
@@ -475,7 +476,8 @@ static class Pages
             <select name="signatureProfile" id="signatureProfile">
           {options}
             </select>
-            <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+            <br><small>-T = zaman damgalı; ESXLong = uzun dönemli imza (damga + zincir + OCSP/CRL gömülü, EBYS/arşiv).
+            Damgalı tipler için entegratörde Kamu SM TSA tanımlı olmalı.</small>
           </p>
           <p><button type="submit">İmzala</button></p>
         </form>
@@ -486,12 +488,16 @@ static class Pages
     public static string Result(string sessionId, SessionRecord rec)
     {
         var statusClass = rec.Status == "completed" ? "ok" : "err";
-        // İmza tipi (CAdES/XAdES, BES/-T). Zaman damgalı mı? "-T" ile biter.
+        // İmza tipi etiketi: ESXLong = uzun dönemli; "-T" ile bitenler zaman damgalı; kalanı damgasız.
+        var isLongTerm = rec.SignatureProfile is not null
+            && rec.SignatureProfile.Contains("ESXLONG", StringComparison.OrdinalIgnoreCase);
         var timestamped = rec.SignatureProfile is not null
             && rec.SignatureProfile.EndsWith("-T", StringComparison.OrdinalIgnoreCase);
+        var profileDesc = isLongTerm ? "uzun dönemli (zaman damgalı + zincir/OCSP/CRL gömülü)"
+                        : timestamped ? "zaman damgalı" : "damgasız";
         var fileExt = string.IsNullOrEmpty(rec.FileExtension) ? ".p7s" : rec.FileExtension;
         var profileLine = rec.SignatureProfile is { Length: > 0 }
-            ? $"""<p>İmza tipi: <code>{rec.SignatureProfile}</code> ({(timestamped ? "zaman damgalı" : "damgasız")})</p>"""
+            ? $"""<p>İmza tipi: <code>{rec.SignatureProfile}</code> ({profileDesc})</p>"""
             : "";
         var contentTypeLine = rec.ContentType is { Length: > 0 }
             ? $"<p>İçerik türü: <code>{rec.ContentType}</code></p>"

@@ -35,7 +35,7 @@ Entegratör backend'i bu endpoint'leri çağırır: oturum oluştur (zorunlu), s
 {
   "documentBase64":     "<base64 belge>",                    // zorunlu
   "documentName":       "Sozlesme_2026.pdf",                  // ops; Desktop diyaloğunda gösterilir
-  "signatureProfile":   "CAdES-BES",                          // CAdES-BES | CAdES-T | XAdES-BES | XAdES-T ("-T" = zaman damgalı, TSA gerekir)
+  "signatureProfile":   "CAdES-BES",                          // CAdES-BES | CAdES-T | CAdES-ESXLong | XAdES-BES | XAdES-T ("-T"/ESXLong = zaman damgalı, TSA gerekir; ESXLong = uzun dönemli)
   "digestAlgorithm":    "SHA256",                             // ops: SHA256 | SHA384 | SHA512
   "callbackUrl":        "https://acme.example/wsign/callback",// zorunlu; host allowlist'te olmalı
   "successRedirectUrl": "https://acme.example/imza/tamam",    // zorunlu; host allowlist'te olmalı
@@ -60,9 +60,9 @@ Yanıt `201`:
 Hatalar: `401 UNAUTHORIZED`, `400 INVALID_BODY|INVALID_NONCE|INVALID_PROFILE|TSA_NOT_CONFIGURED`,
 `403 CALLBACK_NOT_ALLOWED|REDIRECT_NOT_ALLOWED`, `413 PAYLOAD_TOO_LARGE`.
 
-> `TSA_NOT_CONFIGURED` yalnızca zaman damgalı tip (`CAdES-T` / `XAdES-T`)
-> istendiğinde ve entegratör kaydında **Kamu SM TSA** tanımlı olmadığında döner.
-> İmza tipi seçimi: [`signature-profiles.md`](signature-profiles.md).
+> `TSA_NOT_CONFIGURED` yalnızca zaman damgalı tip (`CAdES-T` / `XAdES-T` /
+> `CAdES-ESXLong`) istendiğinde ve entegratör kaydında **Kamu SM TSA** tanımlı
+> olmadığında döner. İmza tipi seçimi: [`signature-profiles.md`](signature-profiles.md).
 
 Entegratör `redirectUrl`'i alır ve kullanıcıyı **302** ile oraya yönlendirir.
 
@@ -85,7 +85,7 @@ Yanıt `200`:
   "signerCertificateBase64": "<DER cert — yalnızca completed; aksi halde null>",
   "contentType":             "application/pkcs7-mime",     // imzalı dosyanın MIME'ı (profile göre)
   "fileExtension":           ".p7s",                       // imzalı dosyanın uzantısı (profile göre)
-  "signatureProfile":        "CAdES-BES",                  // uygulanan imza tipi (CAdES-BES|CAdES-T|XAdES-BES|XAdES-T)
+  "signatureProfile":        "CAdES-BES",                  // uygulanan imza tipi (CAdES-BES|CAdES-T|CAdES-ESXLong|XAdES-BES|XAdES-T)
   "completedAt":             "2026-06-28T10:00:00Z",      // completed değilse null
   "nonce":                   "<istekteki nonce aynen>",
   "metadata":                { "talepNo": "A-123" }        // opak; istekteki aynen

@@ -68,8 +68,9 @@ PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
 # otomatik-POST teslimi, kapalı sistemler için). Bkz. docs/delivery-modes.md.
 RETURN_MODE = env("WSIGN_RETURN_MODE", "redirect")
 
-# Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı.
-ALLOWED_PROFILES = ["CAdES-BES", "CAdES-T", "XAdES-BES", "XAdES-T"]
+# Desteklenen imza tipleri (server ile ortak sabit kontrat). "-T" = zaman damgalı;
+# ESXLong = uzun dönemli imza (zaman damgası + zincir + OCSP/CRL gömülü, EBYS/arşiv için).
+ALLOWED_PROFILES = ["CAdES-BES", "CAdES-T", "CAdES-ESXLong", "XAdES-BES", "XAdES-T"]
 
 
 def normalize_profile(value: str | None) -> str:
@@ -81,8 +82,13 @@ def normalize_profile(value: str | None) -> str:
 
 
 def is_timestamped(profile: str | None) -> bool:
-    """Profil zaman damgalı mı? ("-T" ile biter → CAdES-T / XAdES-T)"""
-    return bool(profile) and profile.upper().endswith("-T")
+    """Profil zaman damgalı mı? ("-T" ile bitenler + uzun dönemli ESXLong)"""
+    return bool(profile) and (profile.upper().endswith("-T") or is_long_term(profile))
+
+
+def is_long_term(profile: str | None) -> bool:
+    """Profil uzun dönemli mi? (CAdES-ESXLong: damga + zincir + OCSP/CRL gömülü)"""
+    return bool(profile) and "ESXLONG" in profile.upper()
 
 
 # İmza tipi varsayılanı: formda seçim yoksa bu kullanılır. Bkz. docs/signature-profiles.md.
@@ -175,10 +181,10 @@ async def sign(belgeMetni: str = Form(""), signatureProfile: str = Form("")):
         return HTMLResponse(page_error(f"W.Sign sunucusuna ulaşılamadı: {ex}"))
 
     if resp.status_code // 100 != 2:
-        # Zaman damgalı tip (-T) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
+        # Zaman damgalı tip (-T / ESXLong) seçildi ama entegratörde Kamu SM TSA tanımlı değil.
         if resp.status_code == 400 and "TSA_NOT_CONFIGURED" in resp.text.upper():
             return HTMLResponse(page_error(
-                "Zaman damgalı imza (CAdES-T/XAdES-T) için entegratörde Kamu SM TSA "
+                "Zaman damgalı imza (CAdES-T/XAdES-T/CAdES-ESXLong) için entegratörde Kamu SM TSA "
                 "tanımlayın veya damgasız (BES) bir tip seçin."
             ))
         return HTMLResponse(page_error(f"Oturum oluşturulamadı ({resp.status_code}): {resp.text}"))
@@ -417,7 +423,8 @@ def page_form(default_profile: str) -> str:
         <select name="signatureProfile" id="signatureProfile">
       {options}
         </select>
-        <br><small>-T = zaman damgalı (CAdES-T/XAdES-T); entegratörde Kamu SM TSA tanımlı olmalı.</small>
+        <br><small>-T = zaman damgalı; ESXLong = uzun dönemli imza (damga + zincir + OCSP/CRL gömülü, EBYS/arşiv).
+        Damgalı tipler için entegratörde Kamu SM TSA tanımlı olmalı.</small>
       </p>
       <p><button type="submit">İmzala</button></p>
     </form>
@@ -429,12 +436,16 @@ def page_result(session_id: str, rec: dict) -> str:
 
     status = rec.get("status", "unknown")
     status_class = "ok" if status == "completed" else "err"
-    # İmza tipi (CAdES/XAdES, BES/-T) + zaman damgalı bilgisi + içerik türü.
+    # İmza tipi (CAdES/XAdES; BES / -T / ESXLong) + damga bilgisi + içerik türü.
     profile = rec.get("signatureProfile") or ""
     file_ext = rec.get("fileExtension") or ".p7s"
+    profile_desc = (
+        "uzun dönemli (zaman damgalı + zincir/OCSP/CRL gömülü)" if is_long_term(profile)
+        else "zaman damgalı" if is_timestamped(profile)
+        else "damgasız"
+    )
     profile_line = (
-        f'<p>İmza tipi: <code>{escape(profile)}</code> '
-        f'({"zaman damgalı" if is_timestamped(profile) else "damgasız"})</p>'
+        f'<p>İmza tipi: <code>{escape(profile)}</code> ({profile_desc})</p>'
         if profile else ""
     )
     content_type_line = (
